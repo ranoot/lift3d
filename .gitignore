@@ -1,0 +1,22 @@
+# Build artifacts
+/build/
+/build-cuda/
+/CMakeFiles/
+/CMakeCache.txt
+compile_commands.json
+
+# Vendored deps (each is its own git repo)
+/cppzmq/
+/libzmq/
+/hdbscan/
+/mask3d_feat/
+/inf_server/
+
+# Large data / recordings / outputs
+*.rrd
+/recordings/
+*.deb
+
+# Harness
+/.claude/
+EOF

@@ -1,0 +1,24 @@
+# clangd config. CMake's compile_commands.json records the nvcc command line for
+# .cu files, but clangd drives parsing with clang — so strip the nvcc-only flags
+# and feed clang the CUDA toolkit path itself.
+CompileFlags:
+  Compiler: clang++
+  Add:
+    # Pin to GCC 15's libstdc++. gcc-16 is installed but has no headers
+    # (/usr/include/c++/16 is missing), and clang otherwise auto-picks the
+    # newest GCC, which makes std::* vanish.
+    - --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_75          # match your GPU; only affects __device__ parsing
+    - --no-cuda-version-check        # CUDA 13.2 is newer than clang officially knows
+    - -I/usr/local/cuda/include
+    - -I/usr/local/cuda/include/cccl  # libcu++/CCCL (<cuda/atomic>, <cuda/std/bit>); CUDA 13 moved it here
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --options-file*                # response file clangd can't expand
+    - --generate-code*
+    - --expt*
+    - -rdc=true
+    - -Xcompiler*
+    - -Xcudafe*
+    - -gencode*

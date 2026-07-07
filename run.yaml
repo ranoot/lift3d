@@ -1,0 +1,76 @@
+# Semantic-Universe pipeline config. Load with:
+#   ./build-cuda/run_semantic_universe --config run.yaml
+#   ./build-cuda/viz_semantic_universe --config run.yaml --spawn
+# Any key omitted here falls back to its built-in default. CLI overrides:
+#   --log <folder>   --out <file.rrd>   --spawn   (take precedence over this file)
+
+# ---- recording ----
+log:    ~/dog_logs/20260608_test_log_officePantryNarrowCorridor
+calib:  ""            # empty => <log>/../CameraCalRaiboAsQUGV113.xml
+cam:    211
+out:    recordings/sem_universe_with_fgg.rrd
+
+# ---- accumulation window ----
+start:  0
+count:  3000
+stride: 3
+
+# ---- map + projection ----
+voxel:  0.05          # world voxel fusion size (m)
+radius: 4             # local crop radius for labelling (m); 0 => whole map
+tau:    0.1           # z-buffer visibility tolerance (m)
+splat:  1             # z-buffer depth dilation radius (px)
+
+# ---- semantic label gate ----
+min_votes:   1        # min total votes for a point to take a class
+min_conf:    0.2      # min winning fraction (0..1)
+things_only: false    # if true, only vote object (thing) classes
+
+# ---- inference server + vocabulary ----
+endpoint: ipc:///tmp/inf_server.ipc
+thing: [door, chair, table, person, trash can, box, monitor, shelf, window, monitor, lockers, vending machine, meeting pod]
+stuff: [wall, floor, ceiling]
+
+# ---- refine cadence ----
+# Features, superpoints, and growing all refresh together on this cadence (they must:
+# growing consumes both). Replaces the old per-block `every` intervals.
+refine_every: 10       # frames between local feature/superpoint/grow refreshes
+
+# ---- VCCS superpoints (ephemeral local oversegmentation) ----
+superpoints:
+  enabled:    true
+  seed:       0.6      # VCCS seed resolution (m); larger => fewer/larger superpoints
+  radius:     0        # crop radius (m); 0 => fall back to `radius`
+  thing_frac: 0.5      # majority threshold among thing-labeled members
+  spatial:    0.4      # VCCS spatial importance
+  normal:     1.0      # VCCS normal importance
+  refine:     0        # refineSupervoxels iterations
+
+# ---- per-point Mask3D features (per-window crop, scattered) ----
+features:
+  enabled:  true
+  endpoint: ipc:///tmp/mask3d_feat.ipc
+  radius:   0          # crop radius (m); 0 => fall back to `radius`
+  show:     true       # viz: colour world/features by a PCA-ish projection
+
+# ---- object seeds (per-class whole-map HDBSCAN* over UNCLAIMED points) ----
+# Strict on purpose: raise these to under-detect (fewer, denser objects). Seeds new
+# objects that growing then expands; runs over the whole map's still-unclaimed points.
+hdbscan:
+  enabled:              true
+  every:                100   # frames between seeding passes (heavy)
+  min_pts:              15    # HDBSCAN* core-distance k (density estimate)
+  min_cluster_size:     50    # smaller clusters dissolve into noise
+  min_class_points:     50    # skip a class with fewer unclaimed points
+  allow_single_cluster: true  # let a single-object class resolve to one seed
+
+# ---- feature-guided growing (superpoints -> objects, within the robot radius) ----
+# Affinity = cosine(mean features) * containment(shared voxels / superpoint voxels).
+# A superpoint is merged into its best-affinity in-radius object when affinity >= the
+# threshold. Runs on `refine_every`, after features + superpoints.
+grow:
+  enabled:        true
+  affinity:       0.4   # merge threshold on cosine * containment
+  max_dispersion: 0.5   # skip superpoints whose feature spread exceeds this (unreliable)
+  cand_radius:    1.5    # superpoint<->object gating distance (m) before the volume test
+  require_class:  true  # only merge a superpoint into an object of the same thing class

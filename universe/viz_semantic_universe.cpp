@@ -33,6 +33,7 @@
 #include "superpoints.h"
 #include "point_features.h"
 #include "object_seeds.h"
+#include "objects.h"
 #include "run_config.h"
 #include "dog_log_adaptor.h"
 #include "dog_stream.h"
@@ -152,6 +153,7 @@ int main(int argc, char** argv) {
         Superpoints sp;
         PointFeatures pf;
         ObjectSeeds os;
+        Objects obj;
 
         rerun::RecordingStream rec("lift3d/semantic_universe");
         if (spawn) rec.spawn().exit_on_failure();
@@ -183,6 +185,7 @@ int main(int argc, char** argv) {
             std::vector<rerun::Position3D>          pos_t, pos_s, pos_u;
             std::vector<rerun::components::ClassId> cid_t, cid_s;
             for (int k = 0; k < (int)snap->size(); ++k) {
+                if (!uni.pointAlive(k)) continue;       // tombstoned (dynamic) -> hidden
                 const Universe::PointT& pt = (*snap)[k];
                 const rerun::Position3D xyz(pt.x, pt.y, pt.z);
                 const int cid = uni.pointClassId(k);
@@ -212,34 +215,52 @@ int main(int argc, char** argv) {
             // frames where VCCS actually recomputes (see logSuperpointsAt + the hook),
             // not baked into this always-visible static snapshot.
 
-            // Object seeds (per-class whole-map HDBSCAN*): the headline marker is a big
-            // class-coloured CENTROID per discovered instance (centroid only -- no
-            // bounding box, per the user), plus the member points at a larger radius
-            // than superpoints. Whole-map + static => always visible, no GC risk.
+            // Object SEEDS (tier 2, local HDBSCAN* clusters): a SECONDARY debug layer --
+            // small member points coloured by seed id, no centroid marker (the headline is
+            // the consolidated objects tier below). Static => always visible, no GC risk.
             if (p.hdbscan && os.size() > 0) {
-                std::vector<rerun::Position3D> ctr, mpos;
-                std::vector<rerun::components::ClassId> ctr_cid;
-                std::vector<rerun::components::Text>    ctr_lbl;
+                std::vector<rerun::Position3D> mpos;
                 std::vector<rerun::Color> mcol;
                 for (const ObjectSeed& s : os.list()) {
-                    ctr.emplace_back(s.centroid[0], s.centroid[1], s.centroid[2]);
-                    ctr_cid.emplace_back((uint16_t)s.class_id);
-                    ctr_lbl.emplace_back(uni.semantics().name(s.class_id));
-                    // Colour member points by the object's STABLE id, so a grown object
-                    // keeps its colour across refreshes (ids never shift; list is append-only).
                     const rerun::Color oc = superpointColor((std::uint32_t)s.id);
                     for (int idx : s.points) {
-                        if (idx < 0 || idx >= (int)snap->size()) continue;
+                        if (idx < 0 || idx >= (int)snap->size() || !uni.pointAlive(idx)) continue;
                         const Universe::PointT& pt = (*snap)[idx];
                         mpos.emplace_back(pt.x, pt.y, pt.z);
                         mcol.push_back(oc);
                     }
                 }
                 emit("world/seeds/points",
-                     rerun::Points3D(mpos).with_colors(mcol).with_radii(0.04f)
+                     rerun::Points3D(mpos).with_colors(mcol).with_radii(0.03f)
                          .with_show_labels(false));
-                emit("world/seeds/centroids",
-                     rerun::Points3D(ctr).with_class_ids(ctr_cid).with_labels(ctr_lbl)
+            }
+
+            // OBJECTS (tier 3, the primary output): the headline marker is a big
+            // class-coloured CENTROID per consolidated instance (centroid only -- no
+            // bounding box, per the user), plus its member points coloured by the object's
+            // STABLE id (so a growing object keeps its colour; ids never shift).
+            if (p.objects && obj.size() > 0) {
+                std::vector<rerun::Position3D> ctr, mpos;
+                std::vector<rerun::Color>               ctr_col;
+                std::vector<rerun::components::Text>    ctr_lbl;
+                std::vector<rerun::Color> mcol;
+                for (const Object& o : obj.list()) {
+                    ctr.emplace_back(o.centroid[0], o.centroid[1], o.centroid[2]);
+                    ctr_lbl.emplace_back(uni.semantics().name(o.class_id));
+                    const rerun::Color oc = superpointColor((std::uint32_t)o.id);
+                    ctr_col.push_back(oc);
+                    for (int idx : o.points) {
+                        if (idx < 0 || idx >= (int)snap->size() || !uni.pointAlive(idx)) continue;
+                        const Universe::PointT& pt = (*snap)[idx];
+                        mpos.emplace_back(pt.x, pt.y, pt.z);
+                        mcol.push_back(oc);
+                    }
+                }
+                emit("world/objects/points",
+                     rerun::Points3D(mpos).with_colors(mcol).with_radii(0.045f)
+                         .with_show_labels(false));
+                emit("world/objects/centroids",
+                     rerun::Points3D(ctr).with_colors(ctr_col).with_labels(ctr_lbl)
                          .with_radii(0.15f));
             }
 
@@ -259,6 +280,7 @@ int main(int argc, char** argv) {
             std::vector<std::array<float, 3>> proj;
             float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
             for (int k = 0; k < (int)snap->size(); ++k) {
+                if (!uni.pointAlive(k)) continue;       // tombstoned -> no feature dot
                 const float* fv = pf.feature(k);
                 if (!fv) continue;
                 float pr[3] = {0, 0, 0};
@@ -298,22 +320,22 @@ int main(int argc, char** argv) {
         auto logSuperpointsAt = [&](const float robot[3]) {
             Universe::Cloud::ConstPtr snap = uni.cloud();
             std::vector<rerun::Position3D> sp_pos, th_pos, ctr_pos;
-            std::vector<rerun::Color>      sp_col;
-            std::vector<rerun::components::ClassId> th_cid, ctr_cid;
+            std::vector<rerun::Color>      sp_col, th_col, ctr_col;
             std::vector<rerun::components::Text>    ctr_lbl;
             for (const Superpoint& s : sp.list()) {
                 const bool is_thing = s.kind == ClassKind::Thing && s.class_id >= 0;
+                const rerun::Color sc = superpointColor(s.id);
                 for (int idx : s.points) {
-                    if (idx < 0 || idx >= (int)snap->size()) continue;
+                    if (idx < 0 || idx >= (int)snap->size() || !uni.pointAlive(idx)) continue;
                     const Universe::PointT& pt = (*snap)[idx];
                     const rerun::Position3D xyz(pt.x, pt.y, pt.z);
                     sp_pos.push_back(xyz);
-                    sp_col.push_back(superpointColor(s.id));
-                    if (is_thing) { th_pos.push_back(xyz); th_cid.emplace_back((uint16_t)s.class_id); }
+                    sp_col.push_back(sc);
+                    if (is_thing) { th_pos.push_back(xyz); th_col.push_back(sc); }
                 }
                 if (is_thing) {
                     ctr_pos.emplace_back(s.centroid[0], s.centroid[1], s.centroid[2]);
-                    ctr_cid.emplace_back((uint16_t)s.class_id);
+                    ctr_col.push_back(sc);
                     // Label shown on hover/selection (click the sphere): class name plus
                     // the Mask3D-feature dispersion attribute and how many members had a
                     // feature (n=0 => features off or window not yet covered).
@@ -328,13 +350,13 @@ int main(int argc, char** argv) {
                     rerun::Points3D(sp_pos).with_colors(sp_col).with_radii(0.02f)
                         .with_show_labels(false));
             rec.log("world/superpoints/things",
-                    rerun::Points3D(th_pos).with_class_ids(th_cid).with_radii(0.025f)
+                    rerun::Points3D(th_pos).with_colors(th_col).with_radii(0.025f)
                         .with_show_labels(false));
             // show_labels(false): the (now longer) label with the dispersion value is
             // surfaced on hover / in the selection panel when you click the sphere,
             // instead of floating permanently over every centroid.
             rec.log("world/superpoints/centroids",
-                    rerun::Points3D(ctr_pos).with_class_ids(ctr_cid)
+                    rerun::Points3D(ctr_pos).with_colors(ctr_col)
                         .with_labels(ctr_lbl).with_radii(0.08f)
                         .with_show_labels(false));
             // The crop sphere the window was computed over, as a wireframe ellipsoid at
@@ -387,7 +409,8 @@ int main(int argc, char** argv) {
         // consumer (frame hook above). The offline ingestor feeds pushScan/pushImage.
         semantic::OnlineSemantic online(uni, inf, p, &sp,
                                         p.features ? &pf : nullptr, feat.get(),
-                                        p.hdbscan ? &os : nullptr);
+                                        p.hdbscan ? &os : nullptr,
+                                        p.objects ? &obj : nullptr);
         online.setFrameHook(hook);
         DogStream stream(cam, online.hook());
         online.begin();
@@ -418,16 +441,21 @@ int main(int argc, char** argv) {
         // any time cursor, logged once (no per-frame re-log => tiny recording).
         logWorld(true);
 
-        std::printf("logged %d frames | world=%d points | %d classes | sink=%s\n",
-                    frames, uni.size(), sv.size(), spawn ? "spawn" : out.c_str());
+        std::printf("logged %d frames | world=%d points (%d live, %d tombstoned dynamic) "
+                    "| %d classes | sink=%s\n",
+                    frames, uni.size(), uni.aliveCount(), uni.size() - uni.aliveCount(),
+                    sv.size(), spawn ? "spawn" : out.c_str());
         if (p.features)
             std::printf("features: %d/%d pts (%.1f%%) got a %d-d vector%s\n",
                         pf.covered(), uni.size(),
                         uni.size() ? 100.0 * pf.covered() / uni.size() : 0.0, pf.dim(),
                         show_features ? " | shown at world/features" : "");
         if (p.hdbscan)
-            std::printf("object seeds: %d instances | shown at world/seeds/{centroids,points}\n",
+            std::printf("object seeds (tier 2): %d instances | shown at world/seeds/points\n",
                         os.size());
+        if (p.objects)
+            std::printf("objects (tier 3): %d instances | shown at world/objects/{centroids,points}\n",
+                        obj.size());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

@@ -1,5 +1,6 @@
 #include "object_seeds.h"
 #include "hdbscan_extract.h"
+#include "voxel_util.h"          // objutil::VKey/VHash, voxelOf (coarse-cell maturity gate)
 
 // The ONLY translation unit that pulls in the hdbscan / parlay parallel runtime, so
 // the heavy template machinery stays out of everything that includes object_seeds.h.
@@ -12,6 +13,7 @@
 #include <map>
 #include <streambuf>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -30,26 +32,46 @@ struct CoutSilencer {
 };
 } // namespace
 
-// Run whole-map HDBSCAN* per thing class over the still-UNCLAIMED points. For each
-// class we gather the unclaimed points' universe global indices, cluster their xyz
-// with hdbscan<3> + dendrogram, extract strict flat clusters, and APPEND one new
-// ObjectSeed per surviving cluster (claiming its points). Objects are persistent:
-// existing ones are never touched or wiped, so seeding only ever adds instances.
-void ObjectSeeds::seedUnclaimed(const Universe& uni, const Params& p) {
+// Run LOCAL-window HDBSCAN* per thing class over the still-UNCLAIMED, MATURED points.
+// We crop the world to the robot window, gate points on coarse-cell maturity, gather
+// the unclaimed points' universe global indices, cluster their xyz with hdbscan<3> +
+// dendrogram, extract strict flat clusters, and APPEND one new ObjectSeed per surviving
+// cluster (claiming its points). Objects are persistent: existing ones are never touched
+// or wiped, so seeding only ever adds instances.
+void ObjectSeeds::seedLocal(const Universe& uni, const Params& p,
+                            const float center[3], float radius) {
     ++version_;
-    const int total = uni.size();
-    if (total == 0) return;
+    if (uni.size() == 0) return;
     Universe::Cloud::ConstPtr cloud = uni.cloud();
+    if (!cloud || cloud->empty()) return;
 
-    // Bucket every UNCLAIMED thing-labeled point by its resolved class id (one
-    // whole-map pass). Points already owned by an object are excluded, so grown
-    // objects are not re-clustered and the input shrinks as the map fills in.
+    // Crop the world to the local window around the robot. HDBSCAN runs on this window
+    // only -- never the whole map (radius <= 0 falls back to the whole world).
+    std::vector<int> win;
+    uni.local(center, radius, &win);
+    if (win.empty()) return;
+
+    // Maturity gate: histogram the window's points into coarse (~2 m^3) cells; a cell is
+    // clusterable only once it holds >= maturity_min occupied fine voxels (map points).
+    // Pure geometric density -- keeps HDBSCAN off sparse, half-observed geometry.
+    const float cinv = 1.0f / (p.maturity_res > 0.0f ? p.maturity_res : 1.0f);
+    std::unordered_map<objutil::VKey, int, objutil::VHash> cell_count;
+    cell_count.reserve(win.size());
+    for (int g : win) cell_count[objutil::voxelOf((*cloud)[g], cinv)]++;
+    const int mat_min = std::max(1, p.maturity_min);
+
+    // Bucket every UNCLAIMED thing-labeled point in a MATURED cell by its resolved class
+    // id. Points already owned by an object are excluded, so grown objects are not
+    // re-clustered and the input shrinks as the map fills in.
     std::map<int, std::vector<int>> by_class;
-    for (int i = 0; i < total; ++i)
-        if (uni.pointIsThing(i) && !claimed(i)) {
-            const int cid = uni.pointClassId(i);
-            if (cid >= 0) by_class[cid].push_back(i);
-        }
+    for (int i : win) {
+        if (!uni.pointIsThing(i) || claimed(i)) continue;
+        const int cid = uni.pointClassId(i);
+        if (cid < 0) continue;
+        auto it = cell_count.find(objutil::voxelOf((*cloud)[i], cinv));
+        if (it == cell_count.end() || it->second < mat_min) continue;   // immature cell
+        by_class[cid].push_back(i);
+    }
 
     const int min_pts = std::max(1, p.min_pts);
     CoutSilencer silence;                              // mute the lib's per-call cout spam

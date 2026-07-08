@@ -179,6 +179,21 @@ public:
 
     const SemanticVocabulary& semantics() const { return sem_; }
 
+    // ---- tombstoning (soft delete) -------------------------------------------
+    // Mark a world point DEAD so every read-time enumeration skips it: local()
+    // crops (hence projection candidates, features, superpoints, seeds), export,
+    // and viz. The point KEEPS its index -- nothing is erased or reindexed -- so
+    // all downstream global indices (vox_, votes_, features, seeds/objects) stay
+    // valid; dead points are simply filtered wherever the world is read. Its vote
+    // histogram is cleared so it also reads as unlabeled if a caller forgets to
+    // skip it. Used to drop dynamic objects (people) that the wide-FOV lidar fused
+    // but a camera later catches on a "dynamic" 2D segment. Out-of-range => no-op.
+    // A later fuse into the same voxel REVIVES the slot (the geometry there changed),
+    // so a spot a person vacated can be reclaimed by real static geometry.
+    void killPoint(int global_idx);
+    bool pointAlive(int i) const;   // false if dead OR out of range
+    int  aliveCount() const;        // # live points (size() still counts dead)
+
     // Build a PointXYZL cloud (xyz + resolved class id) for PCD export / PCL label
     // tools. label = pointClassId+1 (0 == unlabeled). Geometry stays PointXYZI live.
     pcl::PointCloud<pcl::PointXYZL>::Ptr labeledCloud() const;
@@ -200,6 +215,7 @@ private:
     float      min_conf_  = 0.0f;             // label gate: min winning fraction
     Cloud::Ptr map_;                          // persistent PointXYZI world (world frame)
     std::vector<int> count_;                  // per-point fusion count, parallel to map_
+    std::vector<std::uint8_t> alive_;         // per-point tombstone (1=live), parallel to map_
     std::unordered_map<VKey, int, VKeyHash> vox_;  // voxel -> index into map_
     std::vector<View> views_;
     float      last_robot_[3] = {0, 0, 0};    // most recent robot world position

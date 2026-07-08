@@ -107,8 +107,10 @@ void Superpoints::buildFromCrop(const std::vector<int>& gidx,
     }
     Universe::Cloud::ConstPtr map = uni.cloud();
 
-    // Centroid + semantics per superpoint. Semantics: majority among THING-labeled
-    // members only (stuff/unlabeled ignored); assign iff winner >= thing_frac.
+    // Centroid + semantics per superpoint. Semantics: pick the majority THING class,
+    // but measure its share over ALL member points (thing + stuff + unlabeled), so a
+    // superpoint is only called a thing when that thing dominates the whole blob --
+    // mostly-unlabeled/stuff superpoints stay Unknown even if their few labeled points agree.
     const SemanticVocabulary& sv = uni.semantics();
     for (Superpoint& sp : list_) {
         double cx = 0, cy = 0, cz = 0;
@@ -128,17 +130,20 @@ void Superpoints::buildFromCrop(const std::vector<int>& gidx,
         sp.centroid[1] = (float)(cy * inv);
         sp.centroid[2] = (float)(cz * inv);
 
+        const int n_total = (int)sp.points.size();     // ALL members, incl. stuff/unlabeled
         sp.class_id = -1;
         sp.kind = ClassKind::Unknown;
         sp.confidence = 0.0f;
-        if (thing_total > 0) {
+        if (thing_total > 0 && n_total > 0) {
             int best_id = -1, best_n = 0;
             for (const auto& kv : thing_votes)
                 if (kv.second > best_n) { best_n = kv.second; best_id = kv.first; }
-            if (best_id >= 0 && (float)best_n >= p.thing_frac * (float)thing_total) {
+            // Share is over the whole superpoint (n_total), not just its thing members,
+            // so thing_frac now means "this fraction of the entire blob is this thing".
+            if (best_id >= 0 && (float)best_n >= p.thing_frac * (float)n_total) {
                 sp.class_id = best_id;
                 sp.kind = ClassKind::Thing;
-                sp.confidence = (float)best_n / (float)thing_total;
+                sp.confidence = (float)best_n / (float)n_total;
             }
         }
 

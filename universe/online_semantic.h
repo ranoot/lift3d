@@ -35,8 +35,9 @@ public:
     // gating as the Params flags). uni/inf are borrowed for the pipeline's lifetime.
     OnlineSemantic(Universe& uni, InfClient& inf, const Params& p,
                    Superpoints* sp = nullptr, PointFeatures* pf = nullptr,
-                   FeatClient* feat = nullptr, ObjectSeeds* os = nullptr)
-        : uni_(uni), inf_(inf), p_(p), sp_(sp), pf_(pf), feat_(feat), os_(os) {}
+                   FeatClient* feat = nullptr, ObjectSeeds* os = nullptr,
+                   Objects* obj = nullptr)
+        : uni_(uni), inf_(inf), p_(p), sp_(sp), pf_(pf), feat_(feat), os_(os), obj_(obj) {}
 
     void setFrameHook(FrameHook h)     { on_frame_   = std::move(h); }
     void setObjectsHook(ObjectsHook h) { on_objects_ = std::move(h); }
@@ -65,6 +66,8 @@ public:
         const bool  do_hdb  = os_ && p_.hdbscan;
         // Feature-guided growing needs all three stages present + its own flag.
         const bool  do_grow = do_feat && do_sp && do_hdb && p_.grow;
+        // Objects tier (seeds -> objects) needs growing + its own flag + the store.
+        const bool  do_objects = do_grow && obj_ && p_.objects;
         const float sp_r    = p_.sp_radius   > 0.0f ? p_.sp_radius   : p_.radius;
         const float feat_r  = p_.feat_radius > 0.0f ? p_.feat_radius : p_.radius;
 
@@ -77,20 +80,20 @@ public:
         prof_.add("vote",           st.vote);
 
         Stopwatch sw;
-        double t_sp = 0, t_feat = 0, t_hdb = 0, t_grow = 0, t_hook = 0;
+        double t_sp = 0, t_feat = 0, t_hdb = 0, t_grow = 0, t_consol = 0, t_hook = 0;
         bool   objects_changed = false;
 
-        // SEED new objects from unclaimed points over the WHOLE map (heavy) -> coarser
-        // cadence. Runs BEFORE growing so fresh seeds are growable this same frame.
-        if (do_hdb && p_.hdbscan_every > 0 && (done_ % p_.hdbscan_every) == 0) {
-            os_->seedUnclaimed(uni_, p_.hdb);
-            prof_.add("hdbscan", t_hdb = sw.lap());
-            objects_changed = true;
-        }
-        // REFINE cadence: features -> superpoints -> grow, which must co-occur (the
-        // affinity merge consumes both). Features still refresh here even if
-        // superpoints/grow are off, preserving the standalone feature path.
+        // REFINE cadence: seed -> features -> superpoints -> grow -> consolidate. Seeding
+        // is COUPLED to this same cadence (no separate hdbscan interval): it must run
+        // BEFORE growing/consolidating so the seeds it births are growable + consolidatable
+        // this same frame. The maturity gate — not the cadence — decides which cells seed,
+        // so coupling here keeps seed coverage in step with the robot instead of lagging
+        // it. Features still refresh even if superpoints/grow are off (standalone path).
         if (p_.refine_every > 0 && (done_ % p_.refine_every) == 0) {
+            if (do_hdb) {
+                os_->seedLocal(uni_, p_.hdb, uni_.robotWorld(), p_.radius);
+                prof_.add("hdbscan", t_hdb = sw.lap());
+            }
             if (do_feat) {
                 // Whole-object features: pull in-radius objects' points (which may spill
                 // past the crop) into the backbone call so their mean feature is complete.
@@ -108,11 +111,19 @@ public:
                 os_->growLocal(uni_, *sp_, *pf_, p_.grow_p, uni_.robotWorld(), p_.radius,
                                p_.voxel);
                 prof_.add("grow", t_grow = sw.lap());
-                objects_changed = true;
+                // Consolidate the (now grown) seeds into objects.
+                if (do_objects) {
+                    obj_->consolidate(uni_, *os_, *pf_, p_.consol_p, uni_.robotWorld(),
+                                      p_.radius, p_.voxel);
+                    const double lc = sw.lap();
+                    prof_.add("consolidate", lc);
+                    t_consol += lc;
+                    objects_changed = true;
+                }
             }
         }
-        // Publish the object list whenever the store changed this frame (seed and/or grow).
-        if (objects_changed && on_objects_) on_objects_(os_->list(), uni_);
+        // Publish the OBJECTS tier whenever it changed this frame (seed and/or grow).
+        if (objects_changed && on_objects_) on_objects_(obj_->list(), uni_);
         if (on_frame_) { on_frame_(done_, sf, m); prof_.add("hook", t_hook = sw.lap()); }
         ++done_;
 
@@ -120,7 +131,7 @@ public:
         // scan_dt is (attached scan time - image time); the camera pose used is
         // interpolated to image time regardless, so this is just visibility.
         // Show "done/total" when the target frame count is known (count > 0).
-        const double frame_ms = st.total() + t_sp + t_feat + t_hdb + t_grow + t_hook;
+        const double frame_ms = st.total() + t_sp + t_feat + t_hdb + t_grow + t_consol + t_hook;
         char fno[24];
         if (p_.count > 0) {
             // Frames actually processed = ceil(count / stride) (stride sub-samples the
@@ -133,10 +144,11 @@ public:
         }
         std::fprintf(stderr,
             "[timing] frame %s | img_t %lld scan_dt %+6.1fms | integ %6.1f  infer %6.1f  "
-            "proj %6.1f  vote %6.1f  sp %6.1f  feat %6.1f  hdb %6.1f  grow %6.1f  hook %6.1f | %7.1f ms\n",
+            "proj %6.1f  vote %6.1f  sp %6.1f  feat %6.1f  hdb %6.1f  grow %6.1f  cons %6.1f  "
+            "hook %6.1f | %7.1f ms\n",
             fno, (long long)sf.image_t, (double)(sf.scan_t - sf.image_t) / 1e6,
             st.read_integrate, st.infer, st.project, st.vote, t_sp, t_feat, t_hdb, t_grow,
-            t_hook, frame_ms);
+            t_consol, t_hook, frame_ms);
     }
 
     // Final whole-map refreshes + the end-of-run timing report. Call once after the
@@ -146,13 +158,15 @@ public:
         const bool  do_feat = pf_ && feat_ && p_.features;
         const bool  do_hdb  = os_ && p_.hdbscan;
         const bool  do_grow = do_feat && do_sp && do_hdb && p_.grow;
+        const bool  do_objects = do_grow && obj_ && p_.objects;
         const float sp_r    = p_.sp_radius   > 0.0f ? p_.sp_radius   : p_.radius;
         const float feat_r  = p_.feat_radius > 0.0f ? p_.feat_radius : p_.radius;
 
         Stopwatch sw;
         // Final pass at the last robot pose: seed any remaining unclaimed points, then
-        // refresh features/superpoints and grow once more so the store is complete.
-        if (do_hdb) { os_->seedUnclaimed(uni_, p_.hdb); prof_.add("hdbscan", sw.lap()); }
+        // refresh features/superpoints, grow, and consolidate once more so the store is
+        // complete.
+        if (do_hdb) { os_->seedLocal(uni_, p_.hdb, uni_.robotWorld(), p_.radius); prof_.add("hdbscan", sw.lap()); }
         if (do_feat) {
             std::vector<int> extra;
             if (do_grow) os_->collectInRadiusPoints(uni_.robotWorld(), p_.radius, extra);
@@ -165,7 +179,11 @@ public:
             os_->growLocal(uni_, *sp_, *pf_, p_.grow_p, uni_.robotWorld(), p_.radius, p_.voxel);
             prof_.add("grow", sw.lap());
         }
-        if (do_hdb && on_objects_) on_objects_(os_->list(), uni_);
+        if (do_objects) {
+            obj_->consolidate(uni_, *os_, *pf_, p_.consol_p, uni_.robotWorld(), p_.radius, p_.voxel);
+            prof_.add("consolidate", sw.lap());
+        }
+        if (do_objects && on_objects_) on_objects_(obj_->list(), uni_);
         char title[64];
         std::snprintf(title, sizeof(title), "run summary (%d frames)", done_);
         prof_.report(title, wall_.elapsed());
@@ -181,6 +199,7 @@ private:
     PointFeatures* pf_;
     FeatClient*    feat_;
     ObjectSeeds*   os_;
+    Objects*       obj_;
 
     FrameHook   on_frame_;
     ObjectsHook on_objects_;

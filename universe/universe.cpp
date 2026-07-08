@@ -51,6 +51,7 @@ void Universe::setLocalRadius(float r) {
 void Universe::clear() {
     map_->clear();
     count_.clear();
+    alive_.clear();
     vox_.clear();
     views_.clear();
     votes_.clear();
@@ -113,6 +114,7 @@ int Universe::integrate(const Cloud& cloud_world, const Camera& view,
             const int idx = static_cast<int>(map_->size());
             map_->push_back(p);
             count_.push_back(1);
+            alive_.push_back(1);            // born live; parallel to map_
             votes_.emplace_back();          // keep the vote store parallel to map_
             color_.push_back({0.0f, 0.0f, 0.0f});   // colour fused later from images
             color_n_.push_back(0);
@@ -120,13 +122,27 @@ int Universe::integrate(const Cloud& cloud_world, const Camera& view,
         } else {
             const int idx = it->second;
             PointT& m = (*map_)[idx];
-            const float n = static_cast<float>(count_[idx]);
-            const float inv = 1.0f / (n + 1.0f);
-            m.x = (m.x * n + p.x) * inv;
-            m.y = (m.y * n + p.y) * inv;
-            m.z = (m.z * n + p.z) * inv;
-            m.intensity = (m.intensity * n + p.intensity) * inv;
-            count_[idx] = count_[idx] + 1;
+            if (!alive_[idx]) {
+                // This voxel was tombstoned (a dynamic object sat here) and its
+                // previous occupant is gone. Reclaim the slot as a FRESH point so
+                // real static geometry can take over the spot -- otherwise a place a
+                // person walked through would blackhole forever. Old votes/colour are
+                // discarded; the new observation defines the point from scratch.
+                m = p;
+                count_[idx] = 1;
+                votes_[idx].clear();
+                color_[idx] = {0.0f, 0.0f, 0.0f};
+                color_n_[idx] = 0;
+                alive_[idx] = 1;
+            } else {
+                const float n = static_cast<float>(count_[idx]);
+                const float inv = 1.0f / (n + 1.0f);
+                m.x = (m.x * n + p.x) * inv;
+                m.y = (m.y * n + p.y) * inv;
+                m.z = (m.z * n + p.z) * inv;
+                m.intensity = (m.intensity * n + p.intensity) * inv;
+                count_[idx] = count_[idx] + 1;
+            }
         }
     }
 
@@ -138,28 +154,36 @@ Universe::Cloud::Ptr Universe::local(const float center[3], float radius,
     Cloud::Ptr out(new Cloud);
     if (out_indices) out_indices->clear();
 
-    // radius <= 0 => the whole world (identity crop).
+    // radius <= 0 => the whole world. Still filters tombstoned points (they are not
+    // part of the readable world), so this is a compacting copy, not an identity one.
+    const int M = static_cast<int>(map_->size());
     if (radius <= 0.0f) {
-        *out = *map_;
-        if (out_indices) {
-            out_indices->resize(map_->size());
-            std::iota(out_indices->begin(), out_indices->end(), 0);
+        out->reserve(M);
+        for (int i = 0; i < M; ++i) {
+            if (!alive_[i]) continue;
+            out->push_back((*map_)[i]);
+            if (out_indices) out_indices->push_back(i);
         }
         return out;
     }
     if (map_->empty()) return out;
 
-    // PCL radius (sphere) search over the world map -> local subset.
-    pcl::KdTreeFLANN<PointT> kd;
-    kd.setInputCloud(map_);
-    PointT q; q.x = center[0]; q.y = center[1]; q.z = center[2]; q.intensity = 0.0f;
-    std::vector<int>   idx;
-    std::vector<float> d2;
-    kd.radiusSearch(q, radius, idx, d2);
-
-    out->reserve(idx.size());
-    for (int i : idx) out->push_back((*map_)[i]);
-    if (out_indices) *out_indices = std::move(idx);
+    // Linear distance (sphere) scan over the world map -> local subset, skipping dead
+    // points. O(M) with no allocation beyond the output. This deliberately replaces a
+    // per-call KdTreeFLANN build over the whole (growing) map: that tree build ran every
+    // frame and dominated the ~300 ms projection cost. Same sphere semantics.
+    const float r2 = radius * radius;
+    for (int i = 0; i < M; ++i) {
+        if (!alive_[i]) continue;
+        const PointT& p = (*map_)[i];
+        const float dx = p.x - center[0];
+        const float dy = p.y - center[1];
+        const float dz = p.z - center[2];
+        if (dx * dx + dy * dy + dz * dz <= r2) {
+            out->push_back(p);
+            if (out_indices) out_indices->push_back(i);
+        }
+    }
     return out;
 }
 
@@ -295,10 +319,28 @@ ClassKind Universe::pointClassKind(int i) const {
     return sem_.kind(pointClassId(i));             // -1 (unlabeled/gated) -> Unknown
 }
 
+// ---- tombstoning -------------------------------------------------------------
+void Universe::killPoint(int i) {
+    if (i < 0 || i >= (int)alive_.size()) return;
+    alive_[i] = 0;
+    votes_[i].clear();                             // also reads as unlabeled if not skipped
+}
+
+bool Universe::pointAlive(int i) const {
+    return i >= 0 && i < (int)alive_.size() && alive_[i] != 0;
+}
+
+int Universe::aliveCount() const {
+    int n = 0;
+    for (std::uint8_t a : alive_) n += (a != 0);
+    return n;
+}
+
 pcl::PointCloud<pcl::PointXYZL>::Ptr Universe::labeledCloud() const {
     pcl::PointCloud<pcl::PointXYZL>::Ptr out(new pcl::PointCloud<pcl::PointXYZL>);
     out->reserve(map_->size());
     for (int i = 0; i < (int)map_->size(); ++i) {
+        if (!alive_[i]) continue;                         // tombstoned -> not exported
         const PointT& p = (*map_)[i];
         pcl::PointXYZL q;
         q.x = p.x; q.y = p.y; q.z = p.z;

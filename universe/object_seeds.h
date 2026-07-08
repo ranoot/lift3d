@@ -3,10 +3,12 @@
 // semantic Universe.
 //
 // SGS-3D's object stage has two halves that this class owns together:
-//   1. SEEDING (whole-map, HDBSCAN*). Within each semantic THING class, cluster the
+//   1. SEEDING (LOCAL window, HDBSCAN*). Within each semantic THING class, cluster the
 //      still-UNCLAIMED points in xyz (3-d) with the parallel HDBSCAN* library
-//      (wangyiqiu/hdbscan). Each dense cluster becomes a new object seed. Strict on
-//      purpose (large min_pts / min_cluster_size) so we under- rather than over-detect.
+//      (wangyiqiu/hdbscan). Clustering runs ONLY on the crop around the robot (never the
+//      whole map), and only over "matured" coarse cells (enough occupied fine voxels).
+//      Each dense cluster becomes a new object seed. Strict on purpose (large min_pts /
+//      min_cluster_size) so we under- rather than over-detect.
 //   2. GROWING (local, feature-guided). Within the robot radius, absorb VCCS
 //      superpoints whose Mask3D feature matches an object and whose volume overlaps it
 //      (see growLocal). This is what makes objects grow past their seed.
@@ -47,28 +49,36 @@ struct ObjectSeed {
 
 class ObjectSeeds {
 public:
-    // HDBSCAN* seeding strictness (used by seedUnclaimed).
+    // HDBSCAN* seeding strictness (used by seedLocal).
     struct Params {
         int  min_pts = 15;             // HDBSCAN* core-distance k (density estimate)
         int  min_cluster_size = 50;    // flat-extraction strictness (smaller -> noise)
         int  min_class_points = 50;    // skip a class with fewer unclaimed points
         bool allow_single_cluster = true;  // let a single-object class resolve to 1 seed
+        // Maturity gate: a coarse cell of edge `maturity_res` (m) is clusterable only
+        // once it holds >= `maturity_min` occupied fine voxels (map points). Keeps
+        // HDBSCAN off half-observed, sparse geometry. (~2 m^3 default cell.)
+        float maturity_res = 1.26f;    // coarse-cell edge (m); 1.26^3 ~= 2 m^3
+        int   maturity_min = 200;      // min occupied fine voxels in a cell to cluster it
     };
 
     // Feature-guided growing knobs (used by growLocal). Affinity of a superpoint to an
     // object = cosine(mean features) * containment(shared voxels / superpoint voxels).
     struct GrowParams {
-        float affinity_thresh = 0.4f;  // merge iff cos * containment >= this
+        float affinity_thresh = 0.6f;  // merge iff cos * containment >= this (raised to
+                                       // curb superpoint oversegmentation into seeds)
         float max_dispersion  = 0.5f;  // skip superpoints with feat_dispersion above this
         float cand_radius     = 1.5f;  // superpoint<->object gating distance (m)
         bool  require_class   = true;  // require sp.class_id == obj.class_id when sp has one
     };
 
     // SEED new objects from the still-unclaimed THING points, once per thing class,
-    // over the WHOLE map. Appends surviving HDBSCAN* clusters as new objects (assigning
-    // ids and claiming their points); existing objects are left untouched. Bumps
-    // version(). Whole-map (not a local crop) by design.
-    void seedUnclaimed(const Universe& uni, const Params& p);
+    // over the LOCAL window around `center` (radius <= 0 => whole map). Only points in
+    // "matured" coarse cells (>= p.maturity_min occupied fine voxels) are clustered.
+    // Appends surviving HDBSCAN* clusters as new objects (assigning ids and claiming
+    // their points); existing objects are left untouched. Bumps version().
+    void seedLocal(const Universe& uni, const Params& p,
+                   const float center[3], float radius);
 
     // GROW existing objects whose centroid is within `radius` of `center` by absorbing
     // feature-consistent, spatially-overlapping superpoints from `sp` (features from

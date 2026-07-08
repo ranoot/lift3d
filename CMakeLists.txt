@@ -168,14 +168,16 @@ target_compile_options(pargeo_hdbscan PRIVATE -O3)
 target_link_libraries(pargeo_hdbscan PUBLIC Threads::Threads)
 set_target_properties(pargeo_hdbscan PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Object store: per-class whole-map HDBSCAN* seeding + the (parlay-free) flat-cluster
-# extraction and feature-guided growing. object_seeds.cpp is the ONLY TU that pulls in
-# parlay, so pargeo_hdbscan is linked PRIVATE -- its heavy includes/defs build
-# object_seeds.cpp but never leak to the drivers (which still transitively link the
-# static lib). object_grow.cpp (growing) stays parlay-free and reads only the Universe/
-# Superpoints/PointFeatures headers.
+# Object store: per-class LOCAL-window HDBSCAN* seeding + the (parlay-free) flat-cluster
+# extraction, feature-guided growing (superpoints->seeds), and seeds->objects
+# consolidation. object_seeds.cpp is the ONLY TU that pulls in parlay, so pargeo_hdbscan
+# is linked PRIVATE -- its heavy includes/defs build object_seeds.cpp but never leak to
+# the drivers (which still transitively link the static lib). object_grow.cpp (growing)
+# and object_consolidate.cpp (consolidation) stay parlay-free and read only the Universe/
+# Superpoints/PointFeatures headers (shared voxel math in voxel_util.h).
 add_library(object_seeds STATIC
-  universe/object_seeds.cpp universe/object_grow.cpp universe/hdbscan_extract.cpp)
+  universe/object_seeds.cpp universe/object_grow.cpp universe/object_consolidate.cpp
+  universe/hdbscan_extract.cpp)
 target_include_directories(object_seeds PUBLIC universe)
 target_link_libraries(object_seeds PUBLIC universe PRIVATE pargeo_hdbscan)
 set_target_properties(object_seeds PROPERTIES POSITION_INDEPENDENT_CODE ON)

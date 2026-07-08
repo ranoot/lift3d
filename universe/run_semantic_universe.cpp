@@ -15,6 +15,7 @@
 #include "superpoints.h"
 #include "point_features.h"
 #include "object_seeds.h"
+#include "objects.h"
 #include "run_config.h"
 #include "dog_log_adaptor.h"
 #include "dog_stream.h"
@@ -81,14 +82,21 @@ int main(int argc, char** argv) {
                         p.feat_radius > 0.0f ? p.feat_radius : p.radius, p.feat.voxel,
                         cfg.feat_endpoint.c_str());
         if (p.grow)
-            std::printf("growing: affinity>=%.2f | max_dispersion=%.2f | cand_radius=%.2f | "
-                        "require_class=%d\n", p.grow_p.affinity_thresh,
+            std::printf("growing (superpoints->seeds): affinity>=%.2f | max_dispersion=%.2f | "
+                        "cand_radius=%.2f | require_class=%d\n", p.grow_p.affinity_thresh,
                         p.grow_p.max_dispersion, p.grow_p.cand_radius,
                         (int)p.grow_p.require_class);
+        if (p.objects)
+            std::printf("objects (seeds->objects): affinity>=%.2f | adj_dilate=%.2f | "
+                        "cand_radius=%.2f | require_class=%d\n", p.consol_p.affinity_thresh,
+                        p.consol_p.adj_dilate, p.consol_p.cand_radius,
+                        (int)p.consol_p.require_class);
         if (p.hdbscan)
-            std::printf("object seeds: whole-map HDBSCAN* every=%d frames | min_pts=%d | "
-                        "min_cluster_size=%d | min_class_points=%d\n", p.hdbscan_every,
-                        p.hdb.min_pts, p.hdb.min_cluster_size, p.hdb.min_class_points);
+            std::printf("object seeds: LOCAL-window HDBSCAN* every=%d frames (coupled to "
+                        "refine) | min_pts=%d | min_cluster_size=%d | min_class_points=%d | "
+                        "maturity(res=%.2f,min=%d)\n",
+                        p.refine_every, p.hdb.min_pts, p.hdb.min_cluster_size,
+                        p.hdb.min_class_points, p.hdb.maturity_res, p.hdb.maturity_min);
         if (reader.size() == 0) return 1;
 
         InfClient inf(p.endpoint);
@@ -107,6 +115,7 @@ int main(int argc, char** argv) {
         Superpoints sp;
         PointFeatures pf;
         ObjectSeeds os;
+        Objects obj;
 
         // Build the pipeline: OnlineSemantic consumes time-aligned SyncedFrames from
         // DogStream (pose interpolated to each image timestamp). The offline
@@ -114,10 +123,11 @@ int main(int argc, char** argv) {
         // driver would use. Objects (the primary output) are reported as discovered.
         semantic::OnlineSemantic online(uni, inf, p, &sp,
                                         p.features ? &pf : nullptr, feat.get(),
-                                        p.hdbscan ? &os : nullptr);
-        online.setObjectsHook([&](const std::vector<ObjectSeed>& objs, const Universe& u) {
+                                        p.hdbscan ? &os : nullptr,
+                                        p.objects ? &obj : nullptr);
+        online.setObjectsHook([&](const std::vector<Object>& objs, const Universe& u) {
             std::size_t pts = 0;
-            for (const ObjectSeed& s : objs) pts += s.points.size();
+            for (const Object& o : objs) pts += o.points.size();
             std::fprintf(stderr, "[objects] %zu objects over %zu map points\n",
                          objs.size(), pts);
         });
@@ -132,8 +142,10 @@ int main(int argc, char** argv) {
         online.finish();
         const int frames = online.frames();
 
-        std::printf("labeled %d frames | world=%d points | vocab=%d classes seen\n",
-                    frames, uni.size(), uni.semantics().size());
+        std::printf("labeled %d frames | world=%d points (%d live, %d tombstoned dynamic) "
+                    "| vocab=%d classes seen\n",
+                    frames, uni.size(), uni.aliveCount(), uni.size() - uni.aliveCount(),
+                    uni.semantics().size());
         std::printf("sync: images pushed=%ld synced=%ld dropped(too_old=%ld overflow=%ld)\n",
                     ingestor.imagesPushed(), stream.emitted(),
                     stream.droppedTooOld(), stream.droppedOverflow());
@@ -143,6 +155,7 @@ int main(int argc, char** argv) {
         std::map<std::string, int> tally;
         int labeled = 0, n_thing = 0, n_stuff = 0;
         for (int i = 0; i < uni.size(); ++i) {
+            if (!uni.pointAlive(i)) continue;             // tombstoned (dynamic) -> skip
             int cid = uni.pointClassId(i);
             if (cid < 0) { tally["<unlabeled>"]++; continue; }
             tally[uni.semantics().name(cid)]++;
@@ -184,16 +197,33 @@ int main(int argc, char** argv) {
                         pf.covered(), uni.size(),
                         uni.size() ? 100.0 * pf.covered() / uni.size() : 0.0, pf.dim());
 
-        // Object seed tally: #instances discovered per thing class (whole-map, strict).
+        // Object seed tally: #seed clusters discovered per thing class (tier 2, strict).
         if (p.hdbscan) {
-            std::map<int, std::pair<int, int>> per;    // class id -> (#objects, #points)
+            std::map<int, std::pair<int, int>> per;    // class id -> (#seeds, #points)
             for (const ObjectSeed& s : os.list()) {
                 auto& e = per[s.class_id];
                 e.first += 1;
                 e.second += (int)s.points.size();
             }
-            std::printf("object seeds: %d instances over %d classes\n",
+            std::printf("object seeds (tier 2): %d instances over %d classes\n",
                         os.size(), (int)per.size());
+            for (const auto& kv : per)
+                std::printf("  %-14s %3d seeds, %8d pts\n",
+                            uni.semantics().name(kv.first).c_str(),
+                            kv.second.first, kv.second.second);
+        }
+
+        // Objects tally (tier 3, the primary output): consolidated instances per class.
+        // Fewer than the seeds above when consolidation merged oversegmented fragments.
+        if (p.objects) {
+            std::map<int, std::pair<int, int>> per;    // class id -> (#objects, #points)
+            for (const Object& o : obj.list()) {
+                auto& e = per[o.class_id];
+                e.first += 1;
+                e.second += (int)o.points.size();
+            }
+            std::printf("objects (tier 3): %d instances over %d classes\n",
+                        obj.size(), (int)per.size());
             for (const auto& kv : per)
                 std::printf("  %-14s %3d objects, %8d pts\n",
                             uni.semantics().name(kv.first).c_str(),

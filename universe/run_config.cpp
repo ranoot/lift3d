@@ -43,6 +43,7 @@ RunConfig loadRunConfig(const std::string& path) {
     p.stride     = std::max(1, root["stride"].as<int>(d.stride));
     p.voxel      = root["voxel"].as<float>(d.voxel);
     p.radius     = root["radius"].as<float>(d.radius);
+    p.proj_radius = root["proj_radius"].as<float>(d.proj_radius);
     p.tau        = root["tau"].as<float>(d.tau);
     p.splat      = root["splat"].as<int>(d.splat);
     p.min_votes  = root["min_votes"].as<int>(d.min_votes);
@@ -53,6 +54,9 @@ RunConfig loadRunConfig(const std::string& path) {
         "door", "chair", "table", "person", "trash can", "box", "monitor", "shelf", "window"});
     p.stuff = root["stuff"].as<std::vector<std::string>>(std::vector<std::string>{
         "wall", "floor", "ceiling"});
+    // Dynamic-object classes whose geometry is rejected at ingest (default: none). Must
+    // also appear in thing/stuff so the 2D model still segments them (the filter mask).
+    p.dynamic = root["dynamic"].as<std::vector<std::string>>(std::vector<std::string>{});
 
     // Shared cadence for features -> superpoints -> growing (they run together).
     p.refine_every = root["refine_every"].as<int>(d.refine_every);
@@ -75,14 +79,20 @@ RunConfig loadRunConfig(const std::string& path) {
     cfg.feat_endpoint = ft["endpoint"].as<std::string>(cfg.feat_endpoint);
     cfg.show_features = ft["show"].as<bool>(cfg.show_features);
 
-    // hdbscan: { enabled, every, min_pts, min_cluster_size, min_class_points, allow_single_cluster }
+    // hdbscan: { enabled, min_pts, min_cluster_size, min_class_points,
+    //            allow_single_cluster, maturity_res, maturity_min }
+    // Seeding runs on the LOCAL window (centred on the robot, radius `radius`), not the
+    // whole map; the maturity gate keeps HDBSCAN off sparse, half-observed cells. Its
+    // cadence is COUPLED to `refine_every` (no separate `every`): it births seeds that
+    // grow/consolidate consume the same frame, so they share one interval.
     YAML::Node hd = root["hdbscan"];
     p.hdbscan       = hd["enabled"].as<bool>(d.hdbscan);
-    p.hdbscan_every = hd["every"].as<int>(d.hdbscan_every);
     p.hdb.min_pts              = hd["min_pts"].as<int>(d.hdb.min_pts);
     p.hdb.min_cluster_size     = hd["min_cluster_size"].as<int>(d.hdb.min_cluster_size);
     p.hdb.min_class_points     = hd["min_class_points"].as<int>(d.hdb.min_class_points);
     p.hdb.allow_single_cluster = hd["allow_single_cluster"].as<bool>(d.hdb.allow_single_cluster);
+    p.hdb.maturity_res         = hd["maturity_res"].as<float>(d.hdb.maturity_res);
+    p.hdb.maturity_min         = hd["maturity_min"].as<int>(d.hdb.maturity_min);
 
     // grow: { enabled, affinity, max_dispersion, cand_radius, require_class }
     YAML::Node gr = root["grow"];
@@ -91,6 +101,18 @@ RunConfig loadRunConfig(const std::string& path) {
     p.grow_p.max_dispersion   = gr["max_dispersion"].as<float>(d.grow_p.max_dispersion);
     p.grow_p.cand_radius      = gr["cand_radius"].as<float>(d.grow_p.cand_radius);
     p.grow_p.require_class     = gr["require_class"].as<bool>(d.grow_p.require_class);
+
+    // objects: { enabled, affinity, adj_min, adj_dilate, cand_radius, require_class }
+    // Seeds -> objects consolidation (tier 3). `affinity` is a pure cosine threshold now
+    // (adjacency is a separate GATE, adj_min); enabled iff objects AND grow (which requires
+    // features/superpoints/hdbscan).
+    YAML::Node ob = root["objects"];
+    p.objects                  = ob["enabled"].as<bool>(d.objects);
+    p.consol_p.affinity_thresh = ob["affinity"].as<float>(d.consol_p.affinity_thresh);
+    p.consol_p.adj_min         = ob["adj_min"].as<float>(d.consol_p.adj_min);
+    p.consol_p.adj_dilate      = ob["adj_dilate"].as<float>(d.consol_p.adj_dilate);
+    p.consol_p.cand_radius     = ob["cand_radius"].as<float>(d.consol_p.cand_radius);
+    p.consol_p.require_class    = ob["require_class"].as<bool>(d.consol_p.require_class);
 
     return cfg;
 }

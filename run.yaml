@@ -8,40 +8,47 @@
 log:    ~/dog_logs/20260608_test_log_officePantryNarrowCorridor
 calib:  ""            # empty => <log>/../CameraCalRaiboAsQUGV113.xml
 cam:    211
-out:    recordings/sem_universe_with_fgg.rrd
+out:    recordings/sem_universe_with_3tier_tuning.rrd
 
 # ---- accumulation window ----
 start:  0
-count:  3000
+count:  4000
 stride: 3
 
 # ---- map + projection ----
 voxel:  0.05          # world voxel fusion size (m)
-radius: 4             # local crop radius for labelling (m); 0 => whole map
-tau:    0.1           # z-buffer visibility tolerance (m)
-splat:  1             # z-buffer depth dilation radius (px)
+radius: 6             # local crop radius for labelling (m); 0 => whole map
+proj_radius: 4.5      # tighter crop for the z-buffer candidate set (m); 0 => use radius
+tau:    0.01           # z-buffer visibility tolerance (m)
+splat:  10             # z-buffer depth dilation radius (px)
 
 # ---- semantic label gate ----
 min_votes:   1        # min total votes for a point to take a class
-min_conf:    0.2      # min winning fraction (0..1)
+min_conf:    0.3      # min winning fraction (0..1)
 things_only: false    # if true, only vote object (thing) classes
 
 # ---- inference server + vocabulary ----
 endpoint: ipc:///tmp/inf_server.ipc
-thing: [door, chair, table, person, trash can, box, monitor, shelf, window, monitor, lockers, vending machine, meeting pod]
+thing: [door, chair, table, person, trash can, box, monitor, shelf, window, monitor, lockers, vending machine, meeting pod, whiteboard]
 stuff: [wall, floor, ceiling]
+# Dynamic-object classes: their points are DROPPED at ingest (never fused into the map),
+# so moving objects leave no smear. Keep them in `thing`/`stuff` above so the 2D model
+# still segments them -- that mask is what the filter uses.
+dynamic: [person]
 
 # ---- refine cadence ----
-# Features, superpoints, and growing all refresh together on this cadence (they must:
-# growing consumes both). Replaces the old per-block `every` intervals.
-refine_every: 10       # frames between local feature/superpoint/grow refreshes
+# Features, superpoints, growing, and objects consolidation all refresh together on this
+# cadence (they must: growing consumes both features + superpoints, consolidation the
+# seeds). These window-ops are expensive, so keep the cadence coarse.
+refine_every: 20       # frames between local feature/superpoint/grow/consolidate refreshes
 
 # ---- VCCS superpoints (ephemeral local oversegmentation) ----
 superpoints:
   enabled:    true
-  seed:       0.6      # VCCS seed resolution (m); larger => fewer/larger superpoints
+  seed:       0.65      # VCCS seed resolution (m); larger => fewer/larger superpoints
   radius:     0        # crop radius (m); 0 => fall back to `radius`
-  thing_frac: 0.5      # majority threshold among thing-labeled members
+  thing_frac: 0.20      # min fraction of ALL member points (incl. stuff/unlabeled) that
+                       # must carry the winning thing class for the superpoint to take it
   spatial:    0.4      # VCCS spatial importance
   normal:     1.0      # VCCS normal importance
   refine:     0        # refineSupervoxels iterations
@@ -53,24 +60,44 @@ features:
   radius:   0          # crop radius (m); 0 => fall back to `radius`
   show:     true       # viz: colour world/features by a PCA-ish projection
 
-# ---- object seeds (per-class whole-map HDBSCAN* over UNCLAIMED points) ----
+# ---- object seeds (per-class LOCAL-WINDOW HDBSCAN* over UNCLAIMED points) ----
 # Strict on purpose: raise these to under-detect (fewer, denser objects). Seeds new
-# objects that growing then expands; runs over the whole map's still-unclaimed points.
+# objects that growing then expands. Runs ONLY on the robot window (radius `radius`),
+# never the whole map, and only over "matured" coarse cells.
 hdbscan:
   enabled:              true
-  every:                100   # frames between seeding passes (heavy)
-  min_pts:              15    # HDBSCAN* core-distance k (density estimate)
-  min_cluster_size:     50    # smaller clusters dissolve into noise
+  # cadence is COUPLED to refine_every (seeds are born, then grown + consolidated the
+  # same frame); the maturity gate below — not a frame counter — decides when to seed.
+  min_pts:              30    # HDBSCAN* core-distance k (density estimate)
+  min_cluster_size:     75    # smaller clusters dissolve into noise
   min_class_points:     50    # skip a class with fewer unclaimed points
   allow_single_cluster: true  # let a single-object class resolve to one seed
+  maturity_res:         1.26  # coarse maturity-cell edge (m); 1.26^3 ~= 2 m^3
+  maturity_min:         200   # min occupied fine voxels in a cell before it is clustered
 
-# ---- feature-guided growing (superpoints -> objects, within the robot radius) ----
+# ---- feature-guided growing (superpoints -> seeds, within the robot radius) ----
 # Affinity = cosine(mean features) * containment(shared voxels / superpoint voxels).
-# A superpoint is merged into its best-affinity in-radius object when affinity >= the
+# A superpoint is merged into its best-affinity in-radius seed when affinity >= the
 # threshold. Runs on `refine_every`, after features + superpoints.
 grow:
   enabled:        true
-  affinity:       0.4   # merge threshold on cosine * containment
+  affinity:       0.6   # merge threshold on cosine * containment (raised: curb overseg)
   max_dispersion: 0.5   # skip superpoints whose feature spread exceeds this (unreliable)
-  cand_radius:    1.5    # superpoint<->object gating distance (m) before the volume test
-  require_class:  true  # only merge a superpoint into an object of the same thing class
+  cand_radius:    1.5    # superpoint<->seed gating distance (m) before the volume test
+  require_class:  true  # only merge a superpoint into a seed of the same thing class
+
+# ---- objects tier (seeds -> objects consolidation, within the robot radius) ----
+# A seed merges into the most feature-similar in-radius object it TOUCHES. Adjacency
+# (fraction of seed voxels within a dilation of the object's voxels) is a GATE, not a
+# score -- it is a boundary fraction, so multiplying it into the affinity made the merge
+# mathematically unreachable (cosine 0.9 * adjacency 0.3 < 0.7 -> one object per seed).
+# Now: gate on adj_min (they abut), score on cosine(mean features). Adjacent, feature-
+# similar seed fragments of one door collapse into a single persistent object; unmatched
+# seeds spawn their own. This is the pipeline's primary output; runs after seed/grow.
+objects:
+  enabled:       true
+  affinity:      0.3    # merge threshold on cosine(mean features) alone
+  adj_min:       0.60 #0.25   # adjacency GATE: min fraction of seed voxels touching the object
+  adj_dilate:    0.15   # adjacency dilation (m): how close seed voxels must be to "touch"
+  cand_radius:   2.0    # seed<->object gating distance (m)
+  require_class: true   # only merge a seed into an object of the same thing class

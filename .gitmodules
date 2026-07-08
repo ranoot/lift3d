@@ -1,0 +1,9 @@
+[submodule "inf_server/DVIS_Plus"]
+	path = inf_server/DVIS_Plus
+	url = https://github.com/KlingAIResearch/DVIS_Plus.git
+[submodule "mask3d_feat/Mask3D"]
+	path = mask3d_feat/Mask3D
+	url = https://github.com/JonasSchult/Mask3D.git
+[submodule "mask3d_feat/MinkowskiEngine"]
+	path = mask3d_feat/MinkowskiEngine
+	url = https://github.com/NVIDIA/MinkowskiEngine.git

@@ -1,0 +1,23 @@
+[project]
+name = "mask3d-feat"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+# Pinned to Python 3.10 + CUDA 11.8 torch so MinkowskiEngine 0.5.4 can build.
+# This venv only talks to the rest of the system over zmq/msgpack, so the older
+# stack here is isolated.
+requires-python = "==3.10.*"
+dependencies = [
+    "msgpack>=1.0",
+    "numpy<2",
+    "torch==2.0.1",
+    "pyzmq>=25",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true

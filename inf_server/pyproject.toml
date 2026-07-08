@@ -1,0 +1,47 @@
+[project]
+name = "inf-server"
+version = "0.1.0"
+description = "IPC inference server around the OV-DVIS++ online model"
+readme = "README.md"
+# Pinned to Python 3.10 + CUDA 11.8 torch so detectron2 + the MSDeformAttn CUDA
+# kernel build against a single, known stack. Like mask3d_feat, this venv only
+# talks to the rest of the system over zmq/msgpack, so the pinned stack here is
+# isolated from the C++/CUDA side of the repo.
+#
+# detectron2 is NOT listed here: it builds CUDA ops from source and must compile
+# against the venv's torch with the cu118 toolchain, so it is installed in a
+# second step (see build_cuda_ext.sh / README) with --no-build-isolation.
+requires-python = "==3.10.*"
+dependencies = [
+    # IPC
+    "pyzmq>=25",
+    "msgpack>=1.0",
+    "numpy<2",
+    # model stack
+    "torch==2.0.1",
+    "torchvision==0.15.2",
+    # build/runtime: torch 2.0.1 + detectron2 import pkg_resources, dropped in
+    # setuptools 81+, so keep an older setuptools in the venv.
+    "setuptools<80",
+    "wheel",
+    # DVIS_Plus runtime deps needed for inference (subset of its requirements.txt)
+    "timm",
+    "einops",
+    "open_clip_torch",
+    "scipy",
+    "shapely",
+    "opencv-python-headless",
+    "scikit-image",
+    "h5py",
+    "pycocotools",
+    "cython",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+torchvision = { index = "pytorch-cu118" }
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true

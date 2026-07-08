@@ -9,8 +9,15 @@ compile_commands.json
 /cppzmq/
 /libzmq/
 /hdbscan/
-/mask3d_feat/
-/inf_server/
+# inf_server & mask3d_feat: our wrapper code is committed; the big upstream trees
+# (DVIS_Plus, Mask3D, MinkowskiEngine) are git submodules (see .gitmodules).
+
+# Python venvs, caches, and model weights (IPC servers) — never in git
+**/.venv/
+**/__pycache__/
+*.py[oc]
+*.pth
+*.ckpt
 
 # Large data / recordings / outputs
 *.rrd
@@ -19,4 +26,7 @@ compile_commands.json
 
 # Harness
 /.claude/
+
+# ONNX export sidequest (standalone, not part of the live pipeline)
+/dvis_export/
 EOF

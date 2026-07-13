@@ -9,13 +9,12 @@
 
 #include "universe.h"
 #include "superpoints.h"
-#include "point_features.h"
 #include "object_seeds.h"
 #include "objects.h"
+#include "instance_ids.h"        // InstanceIdGraph (per-frame DVIS id bridging)
 #include "timing.h"
 #include "dog_stream.h"          // DogStream, SyncedFrame (pulls in dog_log_adaptor.h)
 #include "inf_client.h"
-#include "feat_client.h"
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -83,7 +82,7 @@ inline bool isDynamic(const std::vector<std::string>& dyn, const std::string& na
 // so moving objects never enter the persistent map in the first place. This is done
 // BEFORE fusion on purpose: the map is index-keyed and grow-only, so removing a point
 // after it has been fused would shift every downstream global index (vox_, votes,
-// colours, features, superpoints/seeds/objects) -- far cheaper and safer to never
+// colours, superpoints/seeds/objects) -- far cheaper and safer to never
 // admit it. The incoming scan is one lidar sweep (a single return per direction), so a
 // plain pinhole projection + mask lookup is unambiguous: no z-buffer needed, because if
 // a point lands on a person pixel it *is* the person (the nearest surface on that ray).
@@ -123,9 +122,12 @@ struct Params {
                               // `radius` (fewer points projected); <=0 => use `radius`
     float tau   = 0.1f;    // z-buffer visibility tolerance (m)
     int   splat = 1;       // z-buffer depth dilation radius (px); 0 = single pixel
-    int   min_votes = 1;   // label gate: min total votes to assign a class
-    float min_conf  = 0.0f;// label gate: min winning fraction (0..1) to assign
-    bool  things_only = false; // if set, only "thing" classes are voted (stuff skipped)
+    // Per-pixel front-surface band (m) for the working set: keep every visible point within
+    // this depth of the nearest at its pixel. 0 => one point per pixel (tightest); larger =>
+    // the full front surface at each pixel (more geometry for superpoints/HDBSCAN). Does not
+    // grow with map density -- it is bounded by the visible surface either way.
+    float surf_band = 0.0f;
+    bool  things_only = false; // if set, only "thing" classes are stamped (stuff skipped)
     std::vector<std::string> thing;
     std::vector<std::string> stuff;
     // Class names whose GEOMETRY is rejected from the map at ingest (dynamic objects,
@@ -136,49 +138,30 @@ struct Params {
     std::vector<std::string> dynamic;
     std::string endpoint = "ipc:///tmp/inf_server.ipc";
 
-    // Refine cadence: frames between local refreshes of features -> superpoints ->
-    // growing. These three run TOGETHER (the affinity merge consumes both features and
-    // superpoints), so they share one cadence instead of separate feat/sp intervals.
-    int   refine_every = 10;
-
-    // VCCS superpoints (oversegmentation). Off unless a Superpoints* is passed to
-    // accumulate() AND `superpoints` is set. Refreshed every `refine_every` frames;
-    // `sp_radius` is the local crop radius (<=0 => fall back to `radius`, else whole
-    // map). `sp` holds the VCCS/majority-rule parameters (seed_res, thing_frac, ...).
+    // VCCS superpoints (oversegmentation). Off unless a Superpoints* is passed AND
+    // `superpoints` is set. Runs EVERY frame on the per-view visible thing set (no crop).
+    // `sp` holds the VCCS/majority-rule parameters (seed_res, thing_frac, ...).
     bool  superpoints = false;
-    float sp_radius = 0.0f;
     Superpoints::Params sp;
 
-    // Per-point Mask3D features (mask3d_feat backbone). Off unless a PointFeatures*
-    // AND a FeatClient* are passed to accumulate() AND `features` is set. The backbone
-    // is run every `refine_every` frames over the crop around the robot (radius
-    // `feat_radius`, <=0 => fall back to `radius`, else whole map), scattering the
-    // 96-d per-voxel features into a persistent whole-cloud store. Requires per-point
-    // RGB, which is fused from the camera image during voting whenever `features` is
-    // set. `feat` holds the voxel/colour-normalization params.
-    bool  features = false;
-    float feat_radius = 0.0f;
-    PointFeatures::Params feat;
-
-    // Object seeds (per-class LOCAL-window HDBSCAN* over UNCLAIMED, mature points). Off
-    // unless an ObjectSeeds* is passed AND `hdbscan` is set. Seeding is COUPLED to the
-    // `refine_every` cadence (it births the seeds that grow/consolidate consume that same
-    // frame), so it has no separate interval; the maturity gate — not a frame counter —
-    // decides when a region is ready. `hdb` holds the seeding strictness + maturity gate.
+    // Object proposals (per-class HDBSCAN* over the per-view visible thing set). Off unless
+    // an ObjectSeeds* is passed AND `hdbscan` is set. Runs EVERY frame; proposals are
+    // EPHEMERAL (re-clustered each frame, non-claiming across frames) so the same object is
+    // re-proposed with overlapping voxels for the IoU consolidation. `hdb` holds strictness.
     bool  hdbscan = false;
     ObjectSeeds::Params hdb;
 
-    // Feature-guided growing: within the robot radius, absorb feature-consistent,
-    // volume-overlapping superpoints into nearby SEEDS (runs on the `refine_every`
-    // cadence, after features + superpoints). Enabled iff `grow` AND all three of
-    // features/superpoints/hdbscan are on. `grow_p` holds the affinity thresholds.
+    // Class-histogram-guided growing: absorb this frame's class-consistent, volume-
+    // overlapping superpoints into this frame's proposals (runs after superpoints). Enabled
+    // iff `grow` AND superpoints/hdbscan are on. `grow_p` holds the affinity thresholds.
     bool  grow = false;
     ObjectSeeds::GrowParams grow_p;
 
-    // Objects tier (seeds -> objects consolidation): merge adjacent, feature-similar
-    // seeds into persistent objects (the pipeline's primary output). Runs on the same
-    // seed/grow cadences, after them. Enabled iff `objects` AND grow (which itself
-    // requires features/superpoints/hdbscan). `consol_p` holds the merge thresholds.
+    // Objects tier (proposals -> objects): single-tier Union-Find over the persistent seed
+    // layer -- each proposal is a seed, progressively unioned into the same-class components
+    // it is contained in; objects are the VIRTUAL components promoted past min_merges. The
+    // pipeline's primary output. Runs every frame. Enabled iff `objects` AND grow.
+    // `consol_p` holds the merge_thresh schedule + min_merges.
     bool  objects = false;
     Objects::Params consol_p;
 };
@@ -194,13 +177,17 @@ using FrameHook = std::function<void(int, const SyncedFrame&, const PointPixelMa
 // they index into. Fired when the objects tier is (re)computed.
 using ObjectsHook = std::function<void(const std::vector<Object>&, const Universe&)>;
 
-// One synced frame's core work: integrate geometry, infer 2D labels, project, vote.
-// The camera pose in sf.cam is already interpolated to sf.image_t, so the 2D labels
-// are lifted through the camera pose AT THE IMAGE INSTANT (this is the timeline fix).
-// Returns the new view id. Source-agnostic: no reader, no files.
-inline int stepFrameSynced(Universe& uni, InfClient& inf, const Params& p,
-                           const SyncedFrame& sf, PointPixelMap& out_map,
-                           StepTiming* st = nullptr) {
+// One synced frame's core work: integrate geometry, infer 2D labels, project, and STAMP
+// each visible point with the current frame's class + DVIS instance id (no cross-view
+// voting -- labels are per-frame transient). `out_gidx` receives the NEAREST-PER-PIXEL
+// visible, live global indices of this view (one point per image pixel: the back-projected
+// surface, bounded by image resolution), which is the pipeline's per-view working set
+// before the thing filter. The camera pose in sf.cam is already interpolated to sf.image_t,
+// so labels are lifted at the image instant. Returns the new view id. Source-agnostic.
+inline int stepFrameSynced(Universe& uni, InfClient& inf,
+                           const Params& p, const SyncedFrame& sf, PointPixelMap& out_map,
+                           std::vector<int>& out_gidx, StepTiming* st = nullptr,
+                           InstanceIdGraph* idg = nullptr) {
     Stopwatch sw;
     Universe::Cloud::Ptr cloud = syncedToCloud(sf);
     const double t_build = sw.lap();               // folded into read_integrate below
@@ -210,6 +197,15 @@ inline int stepFrameSynced(Universe& uni, InfClient& inf, const Params& p,
     FrameResult fr = inf.frame(sf.image.rgb, sf.image.h, sf.image.w);
     if (st) st->infer += sw.lap();
 
+    // Bridge this frame's DVIS over-segmentation into the persistent instance graph: union
+    // same-class, physically-touching instance ids so seeding can group by resolved instance
+    // (see ObjectSeeds::seedFromIndices). Thing membership is decided on the RAW model label.
+    if (idg)
+        idg->ingestFrame(fr, [&](int lbl) {
+            return lbl >= 0 &&
+                   uni.semantics().kindOf(inf.className(lbl)) == ClassKind::Thing;
+        });
+
     // Reject dynamic-object points (people, ...) before they are ever fused, so a moving
     // object leaves no smear in the persistent world (see rejectDynamic). No-op if unset.
     if (!p.dynamic.empty())
@@ -218,43 +214,68 @@ inline int stepFrameSynced(Universe& uni, InfClient& inf, const Params& p,
                                    "img" + std::to_string(sf.image_t), sf.robot);
     if (st) st->read_integrate += t_build + sw.lap();
 
-    // Project the world (or local crop) into this view; vote every visible point
-    // with the class at its pixel. global indices lift local results onto the map.
-    // The z-buffer candidate crop uses `proj_radius` when set (tighter than the
-    // feature/grow `radius`), else falls back to `radius`.
+    // Project the world (or local crop) into this view. `proj_radius` caps the z-buffer
+    // candidate crop tighter than the feature/grow `radius` when set, else falls back.
     const float pr = p.proj_radius > 0.0f ? p.proj_radius : p.radius;
     std::vector<int> gidx;
     out_map = (pr > 0.0f) ? uni.projectLocal(view, p.tau, pr, &gidx, p.splat)
                           : uni.project(view, p.tau, p.splat);
     if (st) st->project += sw.lap();
+
+    // Reduce the visible set to the FRONT-SURFACE SHELL per pixel. Pass 1: find the nearest
+    // visible depth at each image pixel. Pass 2: keep every visible point within `surf_band`
+    // metres of that per-pixel nearest. `surf_band == 0` => strict nearest-per-pixel (one
+    // point/pixel, tightest bound); larger => keep the whole front surface at each pixel
+    // (many more points for the geometry stages) while still dropping background that leaks
+    // in behind the shell. Either way the set is bounded by the visible surface, not by how
+    // densely the map has fused -- it does not grow with the map. (Raw z-buffer visibility
+    // admits every point within `tau` of nearest per pixel, which used to make it balloon.)
+    const int   W = fr.w, H = fr.h;
+    const float band = p.surf_band > 0.0f ? p.surf_band : 0.0f;
+    std::vector<float> best_d((std::size_t)W * H, 0.0f);
+    std::vector<char>  seen((std::size_t)W * H, 0);
     for (int k = 0; k < out_map.N; ++k) {
         if (!out_map.isVisible(k)) continue;
         const int u = out_map.u(k), v = out_map.v(k);
-        if (u < 0 || v < 0 || u >= fr.w || v >= fr.h) continue;
+        if (u < 0 || v < 0 || u >= W || v >= H) continue;
         const int idx = pr > 0.0f ? gidx[k] : k;
-        if (!uni.pointAlive(idx)) continue;            // tombstoned -> don't revote/recolour
-        // Fuse this point's observed RGB (for the Mask3D backbone), independent of
-        // the semantic label -- a point's colour accumulates whenever a camera sees it.
-        if (p.features && sf.image.ok() && u < sf.image.w && v < sf.image.h) {
-            const std::size_t off = ((std::size_t)v * sf.image.w + u) * 3;
-            uni.voteColor(idx, sf.image.rgb[off], sf.image.rgb[off + 1], sf.image.rgb[off + 2]);
-        }
+        if (!uni.pointAlive(idx)) continue;            // tombstoned -> skip
+        const std::size_t pix = (std::size_t)v * W + u;
+        const float d = out_map.depth[k];
+        if (!seen[pix] || d < best_d[pix]) { best_d[pix] = d; seen[pix] = 1; }
+    }
+
+    // Stamp per-frame labels (replaces the old vote loop): reset every point to unlabeled,
+    // then paint the front-shell points from THIS frame's maps -- transient by design
+    // (clearFrameLabels each frame). Collect the working-set indices for the stages.
+    uni.clearFrameLabels();
+    out_gidx.clear();
+    out_gidx.reserve(out_map.N);
+    for (int k = 0; k < out_map.N; ++k) {
+        if (!out_map.isVisible(k)) continue;
+        const int u = out_map.u(k), v = out_map.v(k);
+        if (u < 0 || v < 0 || u >= W || v >= H) continue;
+        const int idx = pr > 0.0f ? gidx[k] : k;
+        if (!uni.pointAlive(idx)) continue;            // tombstoned -> skip
+        const std::size_t pix = (std::size_t)v * W + u;
+        if (out_map.depth[k] > best_d[pix] + band) continue;   // behind the front shell
+        out_gidx.push_back(idx);                       // front-surface shell (working set)
         const int lbl = fr.labelAt(u, v);
-        if (lbl < 0) continue;                         // -1 == background, no vote
+        if (lbl < 0) continue;                         // -1 == background, unlabeled
         const std::string& name = inf.className(lbl);
         if (name.empty()) continue;
-        // Tombstone dynamic-object geometry the moment any view catches it on a "person"
-        // segment. This is the cleanup path the ingest filter can't cover: the wide-FOV
-        // lidar fuses people seen OFF to the camera's side (no 2D mask there to reject
-        // them), and they surface later as unlabeled ghosts from other views -- until a
-        // view sees them on a person mask and kills them here. The z-buffer already gated
-        // visibility (isVisible), so only the points actually ON the person die; anything
-        // occluded behind stays. Killed => never voted, never projected/clustered again.
+        // Kill dynamic-object geometry the moment a view catches it on a "person" segment
+        // (the cleanup path the ingest filter can't cover -- see the old note).
         if (isDynamic(p.dynamic, name)) { uni.killPoint(idx); continue; }
-        // "things only": drop region/stuff labels so the map keeps only object votes.
+        // "things only": drop stuff labels so only object geometry carries a class.
         if (p.things_only && uni.semantics().kindOf(name) == ClassKind::Stuff) continue;
-        uni.voteLabel(idx, name);
+        // id_map is OPTIONAL in the server reply (inf_client only fills it when present),
+        // and FrameResult::ok() validates label_map only -- so idAt() would read past an
+        // empty/short id_map. Guard it exactly as the experiment path does.
+        const int inst = fr.id_map.size() == (std::size_t)fr.h * fr.w ? fr.idAt(u, v) : -1;
+        uni.setFrameLabel(idx, name, inst);
     }
+
     if (st) st->vote += sw.lap();
     return view;
 }

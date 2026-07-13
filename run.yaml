@@ -12,92 +12,115 @@ out:    recordings/sem_universe_with_3tier_tuning.rrd
 
 # ---- accumulation window ----
 start:  0
-count:  4000
-stride: 3
+count:  3000
+stride: 1
 
 # ---- map + projection ----
 voxel:  0.05          # world voxel fusion size (m)
-radius: 6             # local crop radius for labelling (m); 0 => whole map
-proj_radius: 4.5      # tighter crop for the z-buffer candidate set (m); 0 => use radius
-tau:    0.01           # z-buffer visibility tolerance (m)
-splat:  10             # z-buffer depth dilation radius (px)
+radius: 6             # fallback for proj_radius when that is unset (m); 0 => whole map
+proj_radius: 7.5      # z-buffer CANDIDATE cull radius (m) -- a projection optimization so we
+                      # don't project the whole map; NOT a processing window. 0 => use radius
+tau:    0.10         # z-buffer visibility tolerance (m)
+splat:  10            # z-buffer depth dilation radius (px)
+surf_band: 0.75      # working-set front-surface band (m): at each pixel keep every visible
+                     # point within this depth of the nearest. 0 => one point/pixel (sparse);
+                     # 0.1 keeps the full front surface -> more geometry for clustering
 
-# ---- semantic label gate ----
-min_votes:   1        # min total votes for a point to take a class
-min_conf:    0.3      # min winning fraction (0..1)
-things_only: false    # if true, only vote object (thing) classes
+# ---- semantic labelling ----
+# Labels are PER-FRAME transient now (no cross-view vote histogram / gate): a point's
+# class is whatever the current frame's 2D segmentation projects onto it.
+things_only: false    # if true, only stamp object (thing) classes
 
 # ---- inference server + vocabulary ----
 endpoint: ipc:///tmp/inf_server.ipc
-thing: [door, chair, table, person, trash can, box, monitor, shelf, window, monitor, lockers, vending machine, meeting pod, whiteboard]
+thing: [door, chair, table, person, trash can, box, monitor, shelf, window, monitor, lockers, meeting pod, whiteboard, trash can, sign, fridge]
 stuff: [wall, floor, ceiling]
 # Dynamic-object classes: their points are DROPPED at ingest (never fused into the map),
 # so moving objects leave no smear. Keep them in `thing`/`stuff` above so the 2D model
 # still segments them -- that mask is what the filter uses.
 dynamic: [person]
 
-# ---- refine cadence ----
-# Features, superpoints, growing, and objects consolidation all refresh together on this
-# cadence (they must: growing consumes both features + superpoints, consolidation the
-# seeds). These window-ops are expensive, so keep the cadence coarse.
-refine_every: 20       # frames between local feature/superpoint/grow/consolidate refreshes
-
-# ---- VCCS superpoints (ephemeral local oversegmentation) ----
+# ---- VCCS superpoints (per-frame oversegmentation of the FULL view, incl. stuff/unlabeled) ----
+# Runs on the whole front-surface shell (not just thing points) so superpoints follow real
+# surfaces and each one is a single object's local geometry; the class histogram supplies
+# the semantics for growing.
 superpoints:
   enabled:    true
-  seed:       0.65      # VCCS seed resolution (m); larger => fewer/larger superpoints
-  radius:     0        # crop radius (m); 0 => fall back to `radius`
-  thing_frac: 0.20      # min fraction of ALL member points (incl. stuff/unlabeled) that
+  seed:       0.20     # VCCS seed resolution (m); larger => fewer/larger superpoints
+  thing_frac: 0.25     # min fraction of ALL member points (incl. stuff/unlabeled) that
                        # must carry the winning thing class for the superpoint to take it
-  spatial:    0.4      # VCCS spatial importance
-  normal:     1.0      # VCCS normal importance
+  spatial:    0.9      # VCCS spatial importance
+  normal:     0.5      # VCCS normal importance
   refine:     0        # refineSupervoxels iterations
 
-# ---- per-point Mask3D features (per-window crop, scattered) ----
-features:
-  enabled:  true
-  endpoint: ipc:///tmp/mask3d_feat.ipc
-  radius:   0          # crop radius (m); 0 => fall back to `radius`
-  show:     true       # viz: colour world/features by a PCA-ish projection
-
-# ---- object seeds (per-class LOCAL-WINDOW HDBSCAN* over UNCLAIMED points) ----
-# Strict on purpose: raise these to under-detect (fewer, denser objects). Seeds new
-# objects that growing then expands. Runs ONLY on the robot window (radius `radius`),
-# never the whole map, and only over "matured" coarse cells.
+# ---- object proposals (per-class HDBSCAN* over the per-frame visible thing set) ----
+# Runs EVERY frame; proposals are ephemeral (re-clustered each frame, non-claiming) so the
+# same object is re-proposed with overlapping voxels for the IoU consolidation below.
 hdbscan:
   enabled:              true
-  # cadence is COUPLED to refine_every (seeds are born, then grown + consolidated the
-  # same frame); the maturity gate below — not a frame counter — decides when to seed.
-  min_pts:              30    # HDBSCAN* core-distance k (density estimate)
-  min_cluster_size:     75    # smaller clusters dissolve into noise
-  min_class_points:     50    # skip a class with fewer unclaimed points
-  allow_single_cluster: true  # let a single-object class resolve to one seed
-  maturity_res:         1.26  # coarse maturity-cell edge (m); 1.26^3 ~= 2 m^3
-  maturity_min:         200   # min occupied fine voxels in a cell before it is clustered
+  min_pts:              30 # 20    # HDBSCAN* core-distance k (density estimate)
+  min_cluster_size:     15 # 30    # smaller clusters dissolve into noise
+  min_class_points:     15 # 20    # skip a class with fewer points this frame
+  allow_single_cluster: false  # let a single-object class resolve to one proposal
+  single_scan:          false  # ONE hdbscan<4> over all classes (class as a far 4th coord)
+                              # vs a scan per class; false => per-class fallback
+  use_instance_ids:     false   # INSTANCE-GUIDED seeding: group thing points by (class,
+                              # resolved DVIS instance) and seed each group WHOLE, bypassing
+                              # HDBSCAN. An InstanceIdGraph bridges DVIS over-segmentation
+                              # (adjacent same-class ids -> one object) so each seed is one
+                              # physical instance; min_cluster_size still gates out dust, and
+                              # points with no instance id fall back to per-class HDBSCAN.
+                              # false => pure-geometry single_scan/per-class clustering.
 
-# ---- feature-guided growing (superpoints -> seeds, within the robot radius) ----
-# Affinity = cosine(mean features) * containment(shared voxels / superpoint voxels).
-# A superpoint is merged into its best-affinity in-radius seed when affinity >= the
-# threshold. Runs on `refine_every`, after features + superpoints.
+# ---- class-histogram-guided growing (superpoints -> this frame's proposals) ----
+# SAI3D region affinity = cosine(class histograms) * containment(shared voxels / superpoint
+# voxels). VCCS now runs on the FULL view, so a dominant-thing superpoint carries a class
+# histogram; it merges into its best-affinity proposal (and ALL its points, incl. unlabeled
+# boundary, are absorbed) when affinity >= threshold. Cosine ~1 for a matched class, so this
+# threshold is effectively a containment floor -- start ~0.4-0.5 and tune.
 grow:
   enabled:        true
-  affinity:       0.6   # merge threshold on cosine * containment (raised: curb overseg)
-  max_dispersion: 0.5   # skip superpoints whose feature spread exceeds this (unreliable)
-  cand_radius:    1.5    # superpoint<->seed gating distance (m) before the volume test
-  require_class:  true  # only merge a superpoint into a seed of the same thing class
+  affinity:       0.15   # merge threshold on cosine(hist) * containment
+  require_class:  true   # only merge a superpoint into a proposal of the same thing class
+  # SAI3D neighborhood-aware growing (opt-in; defaults reproduce the legacy single greedy pass)
+  neighbor_pool:  true  # pool each superpoint's histogram over its KNN neighbors before cosine
+  sweeps:         3      # assignment sweeps (>1 revisits superpoints as objects grow)
+  dis_decay:      0.5    # decay weight applied to neighbor histograms when pooling
+  pool_k:         6      # KNN count over superpoint centroids for pooling
 
-# ---- objects tier (seeds -> objects consolidation, within the robot radius) ----
-# A seed merges into the most feature-similar in-radius object it TOUCHES. Adjacency
-# (fraction of seed voxels within a dilation of the object's voxels) is a GATE, not a
-# score -- it is a boundary fraction, so multiplying it into the affinity made the merge
-# mathematically unreachable (cosine 0.9 * adjacency 0.3 < 0.7 -> one object per seed).
-# Now: gate on adj_min (they abut), score on cosine(mean features). Adjacent, feature-
-# similar seed fragments of one door collapse into a single persistent object; unmatched
-# seeds spawn their own. This is the pipeline's primary output; runs after seed/grow.
+# ---- objects tier (proposals -> objects, single-tier Union-Find over the seed layer) ----
+# Every per-frame proposal is retained as a persistent SEED. A Union-Find groups seeds that
+# are the same physical object: a new seed is unioned into every same-class component it is
+# CONTAINED in (shared voxels / new-seed voxels) past that component's level bar. A
+# component's support = its member-seed count; it becomes a reported OBJECT once support
+# reaches min_merges. Objects are virtual (no committed object entity) -- this is the
+# pipeline's primary output. Progressive merging (SGS-3D / SAI3D), not a one-shot promotion.
 objects:
   enabled:       true
-  affinity:      0.3    # merge threshold on cosine(mean features) alone
-  adj_min:       0.60 #0.25   # adjacency GATE: min fraction of seed voxels touching the object
-  adj_dilate:    0.15   # adjacency dilation (m): how close seed voxels must be to "touch"
-  cand_radius:   2.0    # seed<->object gating distance (m)
-  require_class: true   # only merge a seed into an object of the same thing class
+  merge_thresh:  [0.60, 0.45, 0.40, 0.30, 0.30, 0.25, 0.15]  # union bar by component level (level 1 strictest .. top loosest)
+  min_merges:    4       # merged observations a component needs before it is a reported object
+  require_class: true   # only union seeds of the same thing class
+  # ---- SAI3D global-context merging (opt-in; global_context=false => legacy single-frame path) ----
+  # When enabled, inter-object merges are NOT decided from one frame's voxel overlap. Each frame
+  # deposits confidence-weighted affinity (semantic-histogram cosine * visibility) onto a
+  # persistent edge graph (adj = sum sim*conf / sum conf), and two objects merge only once that
+  # accumulated affinity clears the level bar with enough evidence AND a neighborhood-aggregated
+  # score agrees (SAI3D judge_connect). Kills single-frame spurious bridges.
+  global_context:        true  # master switch for the accumulated-affinity merge path
+  min_evidence:          1.3    # min accumulated confidence before any inter-object merge
+  dis_decay:             0.9    # neighborhood-aggregation decay (judge_connect)
+  use_semantic_affinity: true   # include cosine(class histogram) in the per-frame deposit
+  use_containment:       true   # multiply each deposit by voxel containment (shared/min(|P|,|comp|))
+                                # so a grazing overlap accrues weak evidence -- curbs over-merging
+  use_instance_ids:      true  # boost affinity when DVIS instance ids co-touch (InstanceIdGraph)
+  id_bonus:              0.10   # similarity boost applied on an instance-id overlap
+  small_seg_min:         0      # finish() cleanup: absorb comps with support < this (0 = off)
+  # ---- Overlapping point-set model (opt-in; overlap_sets=false => exclusive-ownership path) ----
+  # When true, higher layers stop OWNING points: a superpoint is grown into EVERY matching
+  # proposal (not just its best) and points are never exclusively claimed, so proposals become
+  # overlapping bags of points (curing the "points gobbled up -> sparse proposals -> meaningless
+  # containment" failure). Tier-3 becomes a virtual Union-Find whose sets are collections of
+  # proposals: a voxel may belong to several components, overlap is located via a
+  # voxel->{components} index, and the FINAL objects are made disjoint by assigning each
+  # contested voxel to its highest-support component. false => the exclusive path, byte-for-byte.
+  overlap_sets:          true

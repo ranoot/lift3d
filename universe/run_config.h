@@ -14,8 +14,6 @@ struct RunConfig {
     std::string out = "sem_universe.rrd";             // viz .rrd sink (viz only)
     int         cam = 211;                            // camera sensor id
     bool        spawn = false;                        // viz: stream to a live viewer
-    bool        show_features = false;                // viz: log world/features colouring
-    std::string feat_endpoint = "ipc:///tmp/mask3d_feat.ipc";
     semantic::Params p;                               // all pipeline parameters
 };
 

@@ -54,7 +54,8 @@ void Universe::clear() {
     alive_.clear();
     vox_.clear();
     views_.clear();
-    votes_.clear();
+    flabel_.clear();
+    fiid_.clear();
     color_.clear();
     color_n_.clear();
     sem_ = SemanticVocabulary{};
@@ -115,7 +116,8 @@ int Universe::integrate(const Cloud& cloud_world, const Camera& view,
             map_->push_back(p);
             count_.push_back(1);
             alive_.push_back(1);            // born live; parallel to map_
-            votes_.emplace_back();          // keep the vote store parallel to map_
+            flabel_.push_back(-1);          // per-frame label, stamped after projection
+            fiid_.push_back(-1);            // per-frame DVIS instance id
             color_.push_back({0.0f, 0.0f, 0.0f});   // colour fused later from images
             color_n_.push_back(0);
             vox_.emplace(k, idx);
@@ -130,7 +132,8 @@ int Universe::integrate(const Cloud& cloud_world, const Camera& view,
                 // discarded; the new observation defines the point from scratch.
                 m = p;
                 count_[idx] = 1;
-                votes_[idx].clear();
+                flabel_[idx] = -1;
+                fiid_[idx] = -1;
                 color_[idx] = {0.0f, 0.0f, 0.0f};
                 color_n_[idx] = 0;
                 alive_[idx] = 1;
@@ -224,30 +227,28 @@ PointPixelMap Universe::projectLocal(int view_id, float tau_vis, float radius,
                              tau_vis, zbuf_dilate);
 }
 
-void Universe::setLabelGate(int min_votes, float min_conf) {
-    min_votes_ = min_votes > 1 ? min_votes : 1;
-    min_conf_  = min_conf < 0.0f ? 0.0f : (min_conf > 1.0f ? 1.0f : min_conf);
-}
-
-// ---- per-point semantics -----------------------------------------------------
+// ---- per-point semantics (per-frame transient) -------------------------------
 void Universe::declareVocab(const std::vector<std::string>& thing,
                             const std::vector<std::string>& stuff) {
     for (const std::string& n : thing) sem_.declare(n, ClassKind::Thing);
     for (const std::string& n : stuff) sem_.declare(n, ClassKind::Stuff);
 }
 
-void Universe::voteLabel(int global_idx, const std::string& class_name) {
-    if (global_idx < 0 || global_idx >= (int)votes_.size()) return;
+void Universe::clearFrameLabels() {
+    // Reset every point to unlabeled for a fresh frame. assign(size, -1) also grows
+    // the arrays if integrate() appended points, keeping them parallel to map_.
+    const std::size_t n = map_ ? map_->size() : 0;
+    flabel_.assign(n, -1);
+    fiid_.assign(n, -1);
+}
+
+void Universe::setFrameLabel(int global_idx, const std::string& class_name,
+                             int instance_id) {
+    if (global_idx < 0 || global_idx >= (int)flabel_.size()) return;
     const int cid = sem_.intern(class_name);
-    if (cid < 0) return;                                   // empty/background -> no vote
-    auto& hist = votes_[global_idx];
-    for (auto& pc : hist) {
-        if (pc.first == (uint16_t)cid) {
-            if (pc.second < 0xffff) ++pc.second;           // saturate, don't wrap
-            return;
-        }
-    }
-    hist.emplace_back((uint16_t)cid, (uint16_t)1);
+    if (cid < 0) return;                                   // empty/background -> unlabeled
+    flabel_[global_idx] = cid;
+    fiid_[global_idx]   = instance_id;
 }
 
 void Universe::voteColor(int global_idx, unsigned char r, unsigned char g,
@@ -274,56 +275,30 @@ int Universe::pointColorCount(int i) const {
     return (i >= 0 && i < (int)color_n_.size()) ? (int)color_n_[i] : 0;
 }
 
-namespace {
-// argmax of a sparse histogram; ties broken by smaller class id (deterministic).
-// Returns {class_id, winning_count, total}; class_id = -1 when empty.
-struct ArgMax { int id; int win; int total; };
-ArgMax argmaxHist(const std::vector<std::pair<uint16_t, uint16_t>>& h) {
-    ArgMax r{-1, 0, 0};
-    for (const auto& pc : h) {
-        r.total += pc.second;
-        if (pc.second > r.win || (pc.second == r.win && (r.id < 0 || pc.first < r.id))) {
-            r.win = pc.second; r.id = pc.first;
-        }
-    }
-    return r;
-}
-} // namespace
-
 int Universe::pointClassId(int i) const {
-    if (i < 0 || i >= (int)votes_.size()) return -1;
-    ArgMax a = argmaxHist(votes_[i]);
-    if (a.id < 0) return -1;
-    if (a.total < min_votes_) return -1;                       // too few votes
-    if (min_conf_ > 0.0f && (float)a.win < min_conf_ * (float)a.total)
-        return -1;                                             // too ambiguous
-    return a.id;
+    if (i < 0 || i >= (int)flabel_.size()) return -1;
+    return flabel_[i];
 }
 
 std::string Universe::pointClassName(int i) const {
     return sem_.name(pointClassId(i));
 }
 
-float Universe::pointClassConfidence(int i) const {
-    if (i < 0 || i >= (int)votes_.size()) return 0.0f;
-    ArgMax a = argmaxHist(votes_[i]);
-    return a.total > 0 ? (float)a.win / (float)a.total : 0.0f;
-}
-
-int Universe::pointVoteTotal(int i) const {
-    if (i < 0 || i >= (int)votes_.size()) return 0;
-    return argmaxHist(votes_[i]).total;
+int Universe::pointInstanceId(int i) const {
+    if (i < 0 || i >= (int)fiid_.size()) return -1;
+    return fiid_[i];
 }
 
 ClassKind Universe::pointClassKind(int i) const {
-    return sem_.kind(pointClassId(i));             // -1 (unlabeled/gated) -> Unknown
+    return sem_.kind(pointClassId(i));             // -1 (unlabeled) -> Unknown
 }
 
 // ---- tombstoning -------------------------------------------------------------
 void Universe::killPoint(int i) {
     if (i < 0 || i >= (int)alive_.size()) return;
     alive_[i] = 0;
-    votes_[i].clear();                             // also reads as unlabeled if not skipped
+    if (i < (int)flabel_.size()) flabel_[i] = -1;  // also reads as unlabeled if not skipped
+    if (i < (int)fiid_.size())   fiid_[i]   = -1;
 }
 
 bool Universe::pointAlive(int i) const {

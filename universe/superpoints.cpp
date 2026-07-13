@@ -1,11 +1,11 @@
 #include "superpoints.h"
-#include "point_features.h"                           // PointFeatures (per-point Mask3D feats)
 
 #include <pcl/point_types.h>                          // pcl::PointXYZ, PointXYZL
 #include <pcl/segmentation/supervoxel_clustering.h>   // VCCS (heavy; kept out of the header)
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -51,8 +51,7 @@ std::uint32_t segmentCrop(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
 }  // namespace
 
 void Superpoints::refreshLocal(const Universe& uni, const float center[3],
-                               float radius, const Params& p,
-                               const PointFeatures* pf) {
+                               float radius, const Params& p) {
     ++version_;                            // every refresh is a new version
     list_.clear();                         // ephemeral: drop the previous window
     if (uni.size() == 0) return;
@@ -73,20 +72,46 @@ void Superpoints::refreshLocal(const Universe& uni, const float center[3],
     if (k == 0) return;
 
     // Build the list from THIS crop's labels only; nothing from earlier windows.
-    buildFromCrop(gidx, labels, k, uni, p, pf);
+    buildFromCrop(gidx, labels, k, uni, p);
 }
 
-void Superpoints::refreshWhole(const Universe& uni, const Params& p,
-                               const PointFeatures* pf) {
+void Superpoints::refreshWhole(const Universe& uni, const Params& p) {
     // A zero-centred whole-world crop (radius <= 0 => the entire map).
     const float c[3] = {0.0f, 0.0f, 0.0f};
-    refreshLocal(uni, c, -1.0f, p, pf);
+    refreshLocal(uni, c, -1.0f, p);
+}
+
+void Superpoints::refreshFromIndices(const Universe& uni, const std::vector<int>& gidx,
+                                     const Params& p) {
+    ++version_;                            // every refresh is a new version
+    list_.clear();                         // ephemeral: drop the previous window
+    Universe::Cloud::ConstPtr map = uni.cloud();
+    if (gidx.empty() || !map || map->empty()) return;
+
+    // Geometry-only PointXYZ copy over the explicit index set; keep a filtered index
+    // list (g2) so labels stay aligned with the points actually pushed (drops any
+    // out-of-range index without shifting the mapping).
+    pcl::PointCloud<pcl::PointXYZ>::Ptr xyz(new pcl::PointCloud<pcl::PointXYZ>);
+    xyz->reserve(gidx.size());
+    std::vector<int> g2;
+    g2.reserve(gidx.size());
+    for (int gi : gidx) {
+        if (gi < 0 || gi >= (int)map->size()) continue;
+        const Universe::PointT& q = (*map)[gi];
+        xyz->emplace_back(q.x, q.y, q.z);
+        g2.push_back(gi);
+    }
+
+    std::vector<int> labels;
+    const std::uint32_t k = segmentCrop(xyz, p, labels);
+    if (k == 0) return;
+
+    buildFromCrop(g2, labels, k, uni, p);
 }
 
 void Superpoints::buildFromCrop(const std::vector<int>& gidx,
                                 const std::vector<int>& labels, std::uint32_t k,
-                                const Universe& uni, const Params& p,
-                                const PointFeatures* pf) {
+                                const Universe& uni, const Params& p) {
     list_.clear();
 
     // Group crop points by their per-window VCCS label (1..k) into compact list
@@ -116,6 +141,7 @@ void Superpoints::buildFromCrop(const std::vector<int>& gidx,
         double cx = 0, cy = 0, cz = 0;
         std::map<int, int> thing_votes;   // thing class id -> member count
         int thing_total = 0;
+        std::set<int> iid_set;            // deduped raw DVIS instance ids this frame
         for (int i : sp.points) {
             const Universe::PointT& q = (*map)[i];
             cx += q.x; cy += q.y; cz += q.z;
@@ -124,7 +150,10 @@ void Superpoints::buildFromCrop(const std::vector<int>& gidx,
                 ++thing_votes[cid];
                 ++thing_total;
             }
+            const int iid = uni.pointInstanceId(i);
+            if (iid >= 0) iid_set.insert(iid);
         }
+        sp.inst_ids.assign(iid_set.begin(), iid_set.end());
         const double inv = sp.points.empty() ? 0.0 : 1.0 / (double)sp.points.size();
         sp.centroid[0] = (float)(cx * inv);
         sp.centroid[1] = (float)(cy * inv);
@@ -147,38 +176,13 @@ void Superpoints::buildFromCrop(const std::vector<int>& gidx,
             }
         }
 
-        // Mask3D-feature dispersion: normalized trace of the members' feature
-        // covariance (trace(cov) / dim == mean per-dimension variance), over the
-        // members that already have a feature. Two-pass (mean, then squared
-        // deviations) for numerical stability; population variance (divide by n).
-        sp.feat_dispersion = 0.0f;
-        sp.feat_count = 0;
-        if (pf) {
-            const int D = pf->dim();
-            std::vector<double> mean(D, 0.0);
-            int n = 0;
-            for (int i : sp.points) {
-                const float* fv = pf->feature(i);
-                if (!fv) continue;
-                for (int d = 0; d < D; ++d) mean[d] += fv[d];
-                ++n;
-            }
-            sp.feat_count = n;
-            if (n >= 2) {
-                const double invn = 1.0 / (double)n;
-                for (int d = 0; d < D; ++d) mean[d] *= invn;
-                double sumsq = 0.0;                 // sum over members & dims of dev^2
-                for (int i : sp.points) {
-                    const float* fv = pf->feature(i);
-                    if (!fv) continue;
-                    for (int d = 0; d < D; ++d) {
-                        const double dv = (double)fv[d] - mean[d];
-                        sumsq += dv * dv;
-                    }
-                }
-                const double trace = sumsq * invn;  // sum_d var_d = trace(cov)
-                sp.feat_dispersion = (float)(trace / (double)D);
-            }
-        }
+        // SAI3D affinity histogram: scatter the thing-class tallies into a dense vector keyed
+        // on the registry class id (stuff/unlabeled left at 0). Raw counts -- cosine is
+        // scale-invariant, and the dominant-thing gate above (class_id >= 0) is what keeps
+        // wall-dominated superpoints out of growing, not the histogram magnitude.
+        sp.hist.assign((std::size_t)sv.size(), 0.0f);
+        for (const auto& kv : thing_votes)
+            if (kv.first >= 0 && kv.first < sv.size())
+                sp.hist[(std::size_t)kv.first] = (float)kv.second;
     }
 }

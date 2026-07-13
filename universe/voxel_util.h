@@ -1,13 +1,12 @@
 #pragma once
-// Shared, parlay-free voxel + feature helpers for the object store's growing
-// (object_grow.cpp) and consolidation (object_consolidate.cpp) stages. Integer voxel
-// keys at an arbitrary resolution (the volume unit for containment / adjacency), plus
-// cosine similarity and a mean-feature reduction over universe global indices. Kept in
-// one header so the two stages agree on the volume unit instead of duplicating the math.
-// Deliberately free of the hdbscan/parlay runtime (which lives only in object_seeds.cpp).
+// Shared, parlay-free voxel helpers for the object store's growing (object_grow.cpp)
+// and consolidation (object_consolidate.cpp) stages. Integer voxel keys at an arbitrary
+// resolution (the volume unit for containment / adjacency), plus cosine similarity of
+// two class histograms. Kept in one header so the two stages agree on the volume unit
+// instead of duplicating the math. Deliberately free of the hdbscan/parlay runtime
+// (which lives only in object_seeds.cpp).
 
 #include "universe.h"           // Universe::PointT
-#include "point_features.h"     // PointFeatures
 
 #include <cmath>
 #include <cstddef>
@@ -54,25 +53,6 @@ inline float cosine(const std::vector<float>& a, const std::vector<float>& b) {
     }
     if (na <= 0 || nb <= 0) return 0.0f;
     return (float)(dot / std::sqrt(na * nb));
-}
-
-// Mean feature over the members of `pts` that already have a Mask3D feature; empty
-// (size 0) if none do. dim comes from the feature store.
-inline std::vector<float> meanFeature(const std::vector<int>& pts, const PointFeatures& pf) {
-    const int dim = pf.dim();
-    std::vector<double> acc((std::size_t)dim, 0.0);
-    int n = 0;
-    for (int g : pts) {
-        const float* f = pf.feature(g);
-        if (!f) continue;
-        for (int c = 0; c < dim; ++c) acc[c] += f[c];
-        ++n;
-    }
-    if (n == 0) return {};
-    std::vector<float> out((std::size_t)dim);
-    const double inv = 1.0 / (double)n;
-    for (int c = 0; c < dim; ++c) out[c] = (float)(acc[c] * inv);
-    return out;
 }
 
 }  // namespace objutil

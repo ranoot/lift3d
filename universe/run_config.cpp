@@ -46,8 +46,7 @@ RunConfig loadRunConfig(const std::string& path) {
     p.proj_radius = root["proj_radius"].as<float>(d.proj_radius);
     p.tau        = root["tau"].as<float>(d.tau);
     p.splat      = root["splat"].as<int>(d.splat);
-    p.min_votes  = root["min_votes"].as<int>(d.min_votes);
-    p.min_conf   = root["min_conf"].as<float>(d.min_conf);
+    p.surf_band  = root["surf_band"].as<float>(d.surf_band);
     p.things_only = root["things_only"].as<bool>(d.things_only);
     p.endpoint   = root["endpoint"].as<std::string>(d.endpoint);
     p.thing = root["thing"].as<std::vector<std::string>>(std::vector<std::string>{
@@ -58,13 +57,10 @@ RunConfig loadRunConfig(const std::string& path) {
     // also appear in thing/stuff so the 2D model still segments them (the filter mask).
     p.dynamic = root["dynamic"].as<std::vector<std::string>>(std::vector<std::string>{});
 
-    // Shared cadence for features -> superpoints -> growing (they run together).
-    p.refine_every = root["refine_every"].as<int>(d.refine_every);
-
-    // superpoints: { enabled, seed, radius, thing_frac, spatial, normal, refine }
+    // superpoints: { enabled, seed, thing_frac, spatial, normal, refine }. VCCS runs on the
+    // per-frame visible thing set (no crop radius).
     YAML::Node sp = root["superpoints"];
     p.superpoints   = sp["enabled"].as<bool>(d.superpoints);
-    p.sp_radius     = sp["radius"].as<float>(d.sp_radius);
     p.sp.seed_res   = sp["seed"].as<float>(d.sp.seed_res);
     p.sp.spatial_w  = sp["spatial"].as<float>(d.sp.spatial_w);
     p.sp.normal_w   = sp["normal"].as<float>(d.sp.normal_w);
@@ -72,47 +68,58 @@ RunConfig loadRunConfig(const std::string& path) {
     p.sp.thing_frac = sp["thing_frac"].as<float>(d.sp.thing_frac);
     p.sp.voxel_res  = p.voxel;                        // VCCS voxel ~ map voxel
 
-    // features: { enabled, endpoint, radius, show }
-    YAML::Node ft = root["features"];
-    p.features    = ft["enabled"].as<bool>(d.features);
-    p.feat_radius = ft["radius"].as<float>(d.feat_radius);
-    cfg.feat_endpoint = ft["endpoint"].as<std::string>(cfg.feat_endpoint);
-    cfg.show_features = ft["show"].as<bool>(cfg.show_features);
-
     // hdbscan: { enabled, min_pts, min_cluster_size, min_class_points,
-    //            allow_single_cluster, maturity_res, maturity_min }
-    // Seeding runs on the LOCAL window (centred on the robot, radius `radius`), not the
-    // whole map; the maturity gate keeps HDBSCAN off sparse, half-observed cells. Its
-    // cadence is COUPLED to `refine_every` (no separate `every`): it births seeds that
-    // grow/consolidate consume the same frame, so they share one interval.
+    //            allow_single_cluster, single_scan }
+    // Seeding runs EVERY frame on the per-frame visible thing set (no crop, no maturity
+    // gate). Proposals are ephemeral: re-clustered each frame and fed to consolidation.
     YAML::Node hd = root["hdbscan"];
     p.hdbscan       = hd["enabled"].as<bool>(d.hdbscan);
     p.hdb.min_pts              = hd["min_pts"].as<int>(d.hdb.min_pts);
     p.hdb.min_cluster_size     = hd["min_cluster_size"].as<int>(d.hdb.min_cluster_size);
     p.hdb.min_class_points     = hd["min_class_points"].as<int>(d.hdb.min_class_points);
     p.hdb.allow_single_cluster = hd["allow_single_cluster"].as<bool>(d.hdb.allow_single_cluster);
-    p.hdb.maturity_res         = hd["maturity_res"].as<float>(d.hdb.maturity_res);
-    p.hdb.maturity_min         = hd["maturity_min"].as<int>(d.hdb.maturity_min);
+    p.hdb.single_scan          = hd["single_scan"].as<bool>(d.hdb.single_scan);
+    p.hdb.use_instance_ids     = hd["use_instance_ids"].as<bool>(d.hdb.use_instance_ids);
 
-    // grow: { enabled, affinity, max_dispersion, cand_radius, require_class }
+    // grow: { enabled, affinity, require_class }. Absorbs this frame's superpoints into this
+    // frame's proposals; affinity = cosine(class histograms) * containment (SAI3D).
     YAML::Node gr = root["grow"];
     p.grow                    = gr["enabled"].as<bool>(d.grow);
     p.grow_p.affinity_thresh  = gr["affinity"].as<float>(d.grow_p.affinity_thresh);
-    p.grow_p.max_dispersion   = gr["max_dispersion"].as<float>(d.grow_p.max_dispersion);
-    p.grow_p.cand_radius      = gr["cand_radius"].as<float>(d.grow_p.cand_radius);
     p.grow_p.require_class     = gr["require_class"].as<bool>(d.grow_p.require_class);
+    // SAI3D neighborhood-aware growing (opt-in): pool sp histograms over KNN neighbors
+    // before the affinity cosine, and iterate the assignment as objects grow.
+    p.grow_p.neighbor_pool     = gr["neighbor_pool"].as<bool>(d.grow_p.neighbor_pool);
+    p.grow_p.sweeps            = gr["sweeps"].as<int>(d.grow_p.sweeps);
+    p.grow_p.dis_decay         = gr["dis_decay"].as<float>(d.grow_p.dis_decay);
+    p.grow_p.pool_k            = gr["pool_k"].as<int>(d.grow_p.pool_k);
 
-    // objects: { enabled, affinity, adj_min, adj_dilate, cand_radius, require_class }
-    // Seeds -> objects consolidation (tier 3). `affinity` is a pure cosine threshold now
-    // (adjacency is a separate GATE, adj_min); enabled iff objects AND grow (which requires
-    // features/superpoints/hdbscan).
+    // objects: { enabled, merge_thresh, min_merges, require_class }
+    // Proposals -> objects (tier 3): single-tier Union-Find over the persistent seed layer.
+    // Each proposal is retained as a seed and progressively unioned into every same-class
+    // component it is contained in past that component's level bar (merge_thresh); a
+    // component is reported as an object once its support reaches min_merges.
     YAML::Node ob = root["objects"];
-    p.objects                  = ob["enabled"].as<bool>(d.objects);
-    p.consol_p.affinity_thresh = ob["affinity"].as<float>(d.consol_p.affinity_thresh);
-    p.consol_p.adj_min         = ob["adj_min"].as<float>(d.consol_p.adj_min);
-    p.consol_p.adj_dilate      = ob["adj_dilate"].as<float>(d.consol_p.adj_dilate);
-    p.consol_p.cand_radius     = ob["cand_radius"].as<float>(d.consol_p.cand_radius);
-    p.consol_p.require_class    = ob["require_class"].as<bool>(d.consol_p.require_class);
+    p.objects                = ob["enabled"].as<bool>(d.objects);
+    p.consol_p.merge_thresh  = ob["merge_thresh"].as<std::vector<float>>(d.consol_p.merge_thresh);
+    p.consol_p.min_merges    = ob["min_merges"].as<int>(d.consol_p.min_merges);
+    p.consol_p.require_class = ob["require_class"].as<bool>(d.consol_p.require_class);
+    // SAI3D global-context merging (opt-in): accumulate confidence-weighted affinity across
+    // frames and gate inter-object merges on multi-view evidence + neighborhood aggregation.
+    p.consol_p.global_context        = ob["global_context"].as<bool>(d.consol_p.global_context);
+    p.consol_p.min_evidence          = ob["min_evidence"].as<float>(d.consol_p.min_evidence);
+    p.consol_p.dis_decay             = ob["dis_decay"].as<float>(d.consol_p.dis_decay);
+    p.consol_p.use_semantic_affinity = ob["use_semantic_affinity"].as<bool>(d.consol_p.use_semantic_affinity);
+    p.consol_p.use_containment       = ob["use_containment"].as<bool>(d.consol_p.use_containment);
+    p.consol_p.use_instance_ids      = ob["use_instance_ids"].as<bool>(d.consol_p.use_instance_ids);
+    p.consol_p.id_bonus              = ob["id_bonus"].as<float>(d.consol_p.id_bonus);
+    p.consol_p.small_seg_min         = ob["small_seg_min"].as<int>(d.consol_p.small_seg_min);
+    // Overlapping point-set model: one master flag under objects:, fanned out to every stage
+    // that enforces exclusivity today (seeding, growing, consolidation).
+    const bool overlap_sets          = ob["overlap_sets"].as<bool>(d.consol_p.overlap_sets);
+    p.consol_p.overlap_sets = overlap_sets;
+    p.hdb.overlap_sets      = overlap_sets;
+    p.grow_p.overlap_sets   = overlap_sets;
 
     return cfg;
 }

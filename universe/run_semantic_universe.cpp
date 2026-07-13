@@ -1,19 +1,17 @@
 // Accumulate a ~/dog_logs recording into a Universe AND assign every world point a
 // semantic class, by lifting the inf_server's 2D panoptic labels through the
 // point-to-pixel mapping and majority-voting across the frames that see each point.
-// Optionally also computes VCCS superpoints, per-point Mask3D features, and per-class
-// object seeds (whole-map HDBSCAN*). All parameters come from a YAML config.
+// Optionally also computes VCCS superpoints and per-class object seeds
+// (whole-map HDBSCAN*). All parameters come from a YAML config.
 //
 // Usage:
 //   run_semantic_universe --config run.yaml [--log <folder>] [--out labeled.pcd]
 //
-// Requires the inf_server running (and, if features/enabled, the mask3d_feat server).
-// See run.yaml for every tunable; the stored semantics key on class *names*, so
-// changing the vocabulary never corrupts the map.
+// Requires the inf_server running. See run.yaml for every tunable; the stored semantics
+// key on class *names*, so changing the vocabulary never corrupts the map.
 
 #include "universe.h"
 #include "superpoints.h"
-#include "point_features.h"
 #include "object_seeds.h"
 #include "objects.h"
 #include "run_config.h"
@@ -21,9 +19,9 @@
 #include "dog_stream.h"
 #include "dog_log_ingestor.h"
 #include "inf_client.h"
-#include "feat_client.h"
 #include "semantic_pipeline.h"
 #include "online_semantic.h"
+#include "object_publisher.h"   // gmd:: EAIRoomObject egress (2D overhead hull + keyed topic)
 
 #include <pcl/io/pcd_io.h>
 
@@ -68,52 +66,39 @@ int main(int argc, char** argv) {
         DogLogReader reader(cfg.log + "/PoseAndPointClouds.bin");
         reader.openCamera(cfg.log + "/camera" + std::to_string(cfg.cam) + ".gclf");
         std::printf("scans=%d images=%d | cam %d %dx%d | voxel %.3f | radius %.2f | "
-                    "tau %.2f | splat %d | gate votes>=%d conf>=%.2f\n",
+                    "tau %.2f | splat %d\n",
                     reader.size(), reader.numImages(), cam.sensor_id, cam.width, cam.height,
-                    p.voxel, p.radius, p.tau, p.splat, p.min_votes, p.min_conf);
+                    p.voxel, p.radius, p.tau, p.splat);
         if (p.superpoints)
-            std::printf("superpoints: VCCS seed=%.2f refine_every=%d frames | radius=%.2f | "
-                        "thing_frac=%.2f (ephemeral: list = latest window only)\n",
-                        p.sp.seed_res, p.refine_every,
-                        p.sp_radius > 0.0f ? p.sp_radius : p.radius, p.sp.thing_frac);
-        if (p.features)
-            std::printf("features: mask3d_feat refine_every=%d frames | radius=%.2f | "
-                        "voxel=%.3f | endpoint=%s\n", p.refine_every,
-                        p.feat_radius > 0.0f ? p.feat_radius : p.radius, p.feat.voxel,
-                        cfg.feat_endpoint.c_str());
+            std::printf("superpoints: VCCS seed=%.2f per-frame (FULL view incl. stuff) | "
+                        "thing_frac=%.2f\n", p.sp.seed_res, p.sp.thing_frac);
         if (p.grow)
-            std::printf("growing (superpoints->seeds): affinity>=%.2f | max_dispersion=%.2f | "
-                        "cand_radius=%.2f | require_class=%d\n", p.grow_p.affinity_thresh,
-                        p.grow_p.max_dispersion, p.grow_p.cand_radius,
+            std::printf("growing (superpoints->proposals): cosine(class hist)*containment "
+                        ">=%.2f | require_class=%d\n", p.grow_p.affinity_thresh,
                         (int)p.grow_p.require_class);
-        if (p.objects)
-            std::printf("objects (seeds->objects): affinity>=%.2f | adj_dilate=%.2f | "
-                        "cand_radius=%.2f | require_class=%d\n", p.consol_p.affinity_thresh,
-                        p.consol_p.adj_dilate, p.consol_p.cand_radius,
+        if (p.objects) {
+            std::printf("objects (proposals->objects): seed Union-Find | min_merges=%d | "
+                        "require_class=%d | merge_thresh=[", p.consol_p.min_merges,
                         (int)p.consol_p.require_class);
+            for (std::size_t i = 0; i < p.consol_p.merge_thresh.size(); ++i)
+                std::printf("%s%.2f", i ? "," : "", p.consol_p.merge_thresh[i]);
+            std::printf("]\n");
+        }
         if (p.hdbscan)
-            std::printf("object seeds: LOCAL-window HDBSCAN* every=%d frames (coupled to "
-                        "refine) | min_pts=%d | min_cluster_size=%d | min_class_points=%d | "
-                        "maturity(res=%.2f,min=%d)\n",
-                        p.refine_every, p.hdb.min_pts, p.hdb.min_cluster_size,
-                        p.hdb.min_class_points, p.hdb.maturity_res, p.hdb.maturity_min);
+            std::printf("object proposals: per-frame seeding (visible thing set) | "
+                        "min_pts=%d | min_cluster_size=%d | min_class_points=%d | "
+                        "instance_ids=%s\n",
+                        p.hdb.min_pts, p.hdb.min_cluster_size, p.hdb.min_class_points,
+                        p.hdb.use_instance_ids ? "on (bridged DVIS instances)" : "off (geometry)");
         if (reader.size() == 0) return 1;
 
         InfClient inf(p.endpoint);
         if (!inf.ping()) { std::fprintf(stderr, "inf_server not responding at %s\n",
                                         p.endpoint.c_str()); return 1; }
 
-        std::unique_ptr<FeatClient> feat;
-        if (p.features) {
-            feat.reset(new FeatClient(cfg.feat_endpoint));
-            if (!feat->ping()) { std::fprintf(stderr, "mask3d_feat not responding at %s\n",
-                                              cfg.feat_endpoint.c_str()); return 1; }
-        }
-
         Universe uni(p.voxel);
         uni.setLocalRadius(p.radius);
         Superpoints sp;
-        PointFeatures pf;
         ObjectSeeds os;
         Objects obj;
 
@@ -122,14 +107,38 @@ int main(int argc, char** argv) {
         // DogLogIngestor feeds it through the SAME pushScan/pushImage interface a live
         // driver would use. Objects (the primary output) are reported as discovered.
         semantic::OnlineSemantic online(uni, inf, p, &sp,
-                                        p.features ? &pf : nullptr, feat.get(),
                                         p.hdbscan ? &os : nullptr,
                                         p.objects ? &obj : nullptr);
-        online.setObjectsHook([&](const std::vector<Object>& objs, const Universe& u) {
-            std::size_t pts = 0;
-            for (const Object& o : objs) pts += o.points.size();
-            std::fprintf(stderr, "[objects] %zu objects over %zu map points\n",
-                         objs.size(), pts);
+        // Publish objects to a ROS2-style keyed topic. Each universe Object becomes a
+        // Common::Entity::EAIRoomObject whose polygon is a 2D overhead (X-Y, world is Z-up) convex
+        // hull of its member points, cleaned with a kNN statistical-outlier pass. Re-publishing the
+        // same objectId overwrites the store; the sink reports every NEW / UPDATED object.
+        // NOTE: Object::id is a Union-Find root that can change when components merge, so upsert
+        // stability is bounded by that root; a persistent id would come from the instance-id layer.
+        const auto vehicle_id = static_cast<uint16_t>(cfg.cam);
+        gmd::ObjectTopic topic;
+        topic.setOnUpdate([](const gmd::EAIRoomObject& o, bool is_new) {
+            std::fprintf(stderr,
+                         "[objects] %s id=(veh %u) label=%s hull=%zu verts centroid=(%.2f,%.2f)\n",
+                         is_new ? "NEW" : "UPDATED", o.objectId.vehicleId, o.label.c_str(),
+                         o.polygon.size(), o.centroid.x, o.centroid.y);
+        });
+        online.setObjectsHook([&, vehicle_id](const std::vector<Object>& objs, const Universe& u) {
+            Universe::Cloud::ConstPtr cloud = u.cloud();
+            std::vector<std::array<float, 3>> xyz;
+            for (const Object& o : objs) {
+                xyz.clear();
+                xyz.reserve(o.points.size());
+                for (int gid : o.points) {
+                    if (gid < 0 || gid >= static_cast<int>(cloud->size())) continue;
+                    if (!u.pointAlive(gid)) continue;
+                    const Universe::PointT& pt = (*cloud)[gid];
+                    xyz.push_back({pt.x, pt.y, pt.z});
+                }
+                if (xyz.empty()) continue;
+                topic.publish(gmd::buildRoomObject(vehicle_id, o.id,
+                                                   u.semantics().name(o.class_id), xyz));
+            }
         });
 
         DogStream stream(cam, online.hook());
@@ -191,12 +200,6 @@ int main(int argc, char** argv) {
                 std::printf("  %-14s %8d  [thing]\n", kv.first.c_str(), kv.second);
         }
 
-        // Mask3D feature coverage: how many world points got a 96-d feature vector.
-        if (p.features)
-            std::printf("features: %d/%d pts (%.1f%%) got a %d-d vector\n",
-                        pf.covered(), uni.size(),
-                        uni.size() ? 100.0 * pf.covered() / uni.size() : 0.0, pf.dim());
-
         // Object seed tally: #seed clusters discovered per thing class (tier 2, strict).
         if (p.hdbscan) {
             std::map<int, std::pair<int, int>> per;    // class id -> (#seeds, #points)
@@ -213,8 +216,9 @@ int main(int argc, char** argv) {
                             kv.second.first, kv.second.second);
         }
 
-        // Objects tally (tier 3, the primary output): consolidated instances per class.
-        // Fewer than the seeds above when consolidation merged oversegmented fragments.
+        // Objects tally (tier 3, the primary output): virtual Union-Find components promoted
+        // past min_merges, per class. Far fewer than seedCount() -- most seeds are the
+        // repeated per-view observations that merged into the same component.
         if (p.objects) {
             std::map<int, std::pair<int, int>> per;    // class id -> (#objects, #points)
             for (const Object& o : obj.list()) {
@@ -222,8 +226,8 @@ int main(int argc, char** argv) {
                 e.first += 1;
                 e.second += (int)o.points.size();
             }
-            std::printf("objects (tier 3): %d instances over %d classes\n",
-                        obj.size(), (int)per.size());
+            std::printf("objects (tier 3): %d promoted over %d classes (from %d seeds)\n",
+                        obj.size(), (int)per.size(), obj.seedCount());
             for (const auto& kv : per)
                 std::printf("  %-14s %3d objects, %8d pts\n",
                             uni.semantics().name(kv.first).c_str(),

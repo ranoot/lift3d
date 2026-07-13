@@ -1,5 +1,6 @@
 #include "object_seeds.h"
 #include "hdbscan_extract.h"
+#include "instance_ids.h"        // InstanceIdGraph (resolves DVIS ids -> bridged instance root)
 #include "voxel_util.h"          // objutil::VKey/VHash, voxelOf (coarse-cell maturity gate)
 
 // The ONLY translation unit that pulls in the hdbscan / parlay parallel runtime, so
@@ -9,8 +10,10 @@
 #include "hdbscan/hdbscan.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <map>
+#include <set>
 #include <streambuf>
 #include <tuple>
 #include <unordered_map>
@@ -30,6 +33,14 @@ struct CoutSilencer {
     CoutSilencer() : old(std::cout.rdbuf(&nb)) {}
     ~CoutSilencer() { std::cout.rdbuf(old); }
 };
+
+// The vendored pargeo::hdbscan MST/WSPD recursion has a base-case bug that reads out of
+// bounds (SIGSEGV) on small inputs: empirically it crashes for n <= 11 (all geometries:
+// cube / planar / collinear / duplicated, independent of minPts) and is always safe for
+// n >= 12. We floor every hdbscan call at this size (margin above 12). Costs nothing: a
+// surviving cluster needs >= min_cluster_size points anyway, so a sub-floor input can
+// never yield one. See the standalone sweep in the segfault investigation.
+constexpr int kHdbscanMinInput = 16;
 } // namespace
 
 // Run LOCAL-window HDBSCAN* per thing class over the still-UNCLAIMED, MATURED points.
@@ -79,8 +90,9 @@ void ObjectSeeds::seedLocal(const Universe& uni, const Params& p,
         const int                cid  = kv.first;
         const std::vector<int>&  gidx = kv.second;
         const int                n    = (int)gidx.size();
-        // Strict pre-gates: enough points overall, and more than the density k.
-        if (n < p.min_class_points || n <= min_pts) continue;
+        // Strict pre-gates: enough points overall, more than the density k, and above the
+        // hdbscan small-input crash floor.
+        if (n < p.min_class_points || n <= min_pts || n < kHdbscanMinInput) continue;
 
         // Build the xyz point set (hdbscan<3> takes a mutable sequence of doubles).
         parlay::sequence<pargeo::point<3>> P(n);
@@ -129,4 +141,215 @@ void ObjectSeeds::seedLocal(const Universe& uni, const Params& p,
             list_.push_back(std::move(s));
         }
     }
+}
+
+// PER-VIEW seeding over an explicit thing-point set (no crop, no maturity gate).
+void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& gidx,
+                                  const Params& p, InstanceIdGraph* idg) {
+    ++version_;
+    // Ephemeral per-frame proposals: wipe last frame's clusters + claims so this frame
+    // re-clusters the current visible set from scratch. Proposals do NOT persist or claim
+    // across frames -- the same physical object is re-proposed every frame with overlapping
+    // voxels, and that overlap is exactly what tier-3 IoU consolidation feeds on.
+    list_.clear();
+    std::fill(owner_.begin(), owner_.end(), -1);
+    Universe::Cloud::ConstPtr cloud = uni.cloud();
+    if (!cloud || cloud->empty() || gidx.empty()) return;
+
+    // Bucket the visible thing points by resolved class (input is already visible ∩ thing;
+    // `claimed` here is a WITHIN-FRAME guard only, since owner_ was just reset above).
+    // Under overlap_sets the guard is dropped so a point may seed more than one cluster.
+    std::map<int, std::vector<int>> by_class;
+    for (int g : gidx) {
+        if (g < 0 || g >= (int)cloud->size()) continue;
+        if (!p.overlap_sets && claimed(g)) continue;
+        const int cid = uni.pointClassId(g);
+        if (cid < 0 || uni.pointClassKind(g) != ClassKind::Thing) continue;
+        by_class[cid].push_back(g);
+    }
+    if (by_class.empty()) return;
+
+    const int min_pts = std::max(1, p.min_pts);
+
+    // Append one new seed from a uniform-class member list: centroid + deduped instance
+    // ids from the members, claim the points, assign a stable id.
+    auto appendSeed = [&](int cid, const std::vector<int>& members) {
+        if (members.empty()) return;
+        ObjectSeed s;
+        s.class_id = cid;
+        s.kind = ClassKind::Thing;
+        double c[3] = {0, 0, 0};
+        std::set<int> iids;
+        for (int g : members) {
+            const Universe::PointT& pt = (*cloud)[g];
+            c[0] += pt.x; c[1] += pt.y; c[2] += pt.z;
+            const int iid = uni.pointInstanceId(g);
+            if (iid >= 0) iids.insert(iid);
+        }
+        const double invn = 1.0 / (double)members.size();
+        s.centroid[0] = (float)(c[0] * invn);
+        s.centroid[1] = (float)(c[1] * invn);
+        s.centroid[2] = (float)(c[2] * invn);
+        s.inst_ids.assign(iids.begin(), iids.end());
+        // SAI3D affinity histogram: a per-class proposal is a single spike at its class id
+        // (weight = member count). growLocal re-aggregates it as superpoints are absorbed.
+        s.hist.assign((std::size_t)uni.semantics().size(), 0.0f);
+        if (cid >= 0 && cid < uni.semantics().size())
+            s.hist[(std::size_t)cid] = (float)members.size();
+        s.points = members;
+        s.id = (int)list_.size();
+        for (int g : members) claim(g, s.id);
+        list_.push_back(std::move(s));
+    };
+
+    // Turn a hdbscan flat-cluster labeling into linkage + extract, grouping members.
+    auto linkageOf = [](const parlay::sequence<pargeo::dendroNode>& dendro) {
+        std::vector<LinkNode> linkage(dendro.size());
+        for (std::size_t r = 0; r < dendro.size(); ++r)
+            linkage[r] = LinkNode{(long)std::get<0>(dendro[r]), (long)std::get<1>(dendro[r]),
+                                  std::get<2>(dendro[r]),        (long)std::get<3>(dendro[r])};
+        return linkage;
+    };
+
+    // Geometric HDBSCAN* over one class's member points: cluster xyz, extract flat clusters,
+    // and append one seed per surviving cluster. The proven per-class path, shared by the
+    // pure-geometry fallback loop and the instance-guided no-instance remainder.
+    auto clusterClass = [&](int cid, const std::vector<int>& mg) {
+        const int n = (int)mg.size();
+        if (n < p.min_class_points || n <= min_pts || n < kHdbscanMinInput) return;
+        parlay::sequence<pargeo::point<3>> P(n);
+        for (int j = 0; j < n; ++j) {
+            const Universe::PointT& pt = (*cloud)[mg[j]];
+            double xyz[3] = {pt.x, pt.y, pt.z};
+            P[j] = pargeo::point<3>(xyz);
+        }
+        parlay::sequence<pargeo::wghEdge> E = pargeo::hdbscan<3>(P, (size_t)min_pts);
+        parlay::sequence<pargeo::dendroNode> dendro = pargeo::dendrogram(E, (size_t)n);
+        std::vector<LinkNode> linkage = linkageOf(dendro);
+        std::vector<int> labels = extractFlatClusters(linkage, n, p.min_cluster_size,
+                                                      p.allow_single_cluster);
+        int k = 0;
+        for (int l : labels) k = std::max(k, l + 1);
+        if (k == 0) return;
+        std::vector<std::vector<int>> members((std::size_t)k);
+        for (int j = 0; j < n; ++j) {
+            const int l = labels[j];
+            if (l >= 0) members[(std::size_t)l].push_back(mg[j]);
+        }
+        for (int l = 0; l < k; ++l) appendSeed(cid, members[(std::size_t)l]);
+    };
+
+    CoutSilencer silence;                              // mute the lib's per-call cout spam
+
+    // INSTANCE-GUIDED seeding (SAI3D "bridge, then split"): trust the model's instance
+    // segmentation over pure geometry. Group thing points by (class, RESOLVED instance root)
+    // -- the InstanceIdGraph has already unioned DVIS's over-segmented, physically-touching
+    // ids, so each group is one physical object -- and seed each group WHOLE (no geometric
+    // split: bridging already merged the fragments, and splitting a tracked instance would
+    // only re-fragment it). Thing points the model left without an instance id fall back to
+    // per-class geometric HDBSCAN.
+    if (idg && p.use_instance_ids) {
+        std::map<std::pair<int, int>, std::vector<int>> by_group;  // (cid, root iid) -> members
+        std::map<int, std::vector<int>>                 no_inst;   // cid -> members (iid < 0)
+        for (int g : gidx) {
+            if (g < 0 || g >= (int)cloud->size() || (!p.overlap_sets && claimed(g))) continue;
+            const int cid = uni.pointClassId(g);
+            if (cid < 0 || uni.pointClassKind(g) != ClassKind::Thing) continue;
+            const int iid = uni.pointInstanceId(g);
+            if (iid >= 0) by_group[{cid, idg->root(iid)}].push_back(g);
+            else          no_inst[cid].push_back(g);
+        }
+        // Real instances: one seed per resolved-instance group (gated on min_cluster_size so
+        // stray dust does not become an object). No HDBSCAN -- the segmentation IS the split.
+        for (const auto& kv : by_group)
+            if ((int)kv.second.size() >= p.min_cluster_size)
+                appendSeed(kv.first.first, kv.second);
+        // No-instance remainder: geometric HDBSCAN per class (the proven fallback).
+        for (const auto& kv : no_inst)
+            clusterClass(kv.first, kv.second);
+        return;
+    }
+
+    if (p.single_scan) {
+        // ONE hdbscan<4>: xyz + (class_slot * CLASS_GAP) as the 4th coordinate, so points
+        // of different classes are astronomically far apart and never join a cluster.
+        // Classes below min_class_points are dropped (too sparse to trust).
+        std::vector<int> all_g, all_cid;
+        std::map<int, int> cid_slot;
+        int next_slot = 0;
+        for (const auto& kv : by_class) {
+            if ((int)kv.second.size() < p.min_class_points) continue;
+            cid_slot[kv.first] = next_slot++;
+            for (int g : kv.second) { all_g.push_back(g); all_cid.push_back(kv.first); }
+        }
+        const int n = (int)all_g.size();
+        if (n <= min_pts || n < kHdbscanMinInput) return;
+
+        constexpr double CLASS_GAP = 1.0e6;            // >> any spatial extent
+        parlay::sequence<pargeo::point<4>> P(n);
+        for (int j = 0; j < n; ++j) {
+            const Universe::PointT& pt = (*cloud)[all_g[j]];
+            double xyzc[4] = {pt.x, pt.y, pt.z, (double)cid_slot[all_cid[j]] * CLASS_GAP};
+            P[j] = pargeo::point<4>(xyzc);
+        }
+        parlay::sequence<pargeo::wghEdge> E = pargeo::hdbscan<4>(P, (size_t)min_pts);
+        parlay::sequence<pargeo::dendroNode> dendro = pargeo::dendrogram(E, (size_t)n);
+        std::vector<LinkNode> linkage = linkageOf(dendro);
+        std::vector<int> labels = extractFlatClusters(linkage, n, p.min_cluster_size,
+                                                      p.allow_single_cluster);
+        int k = 0;
+        for (int l : labels) k = std::max(k, l + 1);
+        if (k == 0) return;
+        std::vector<std::vector<int>> members((std::size_t)k);
+        std::vector<int> mem_cid((std::size_t)k, -1);
+        for (int j = 0; j < n; ++j) {
+            const int l = labels[j];
+            if (l >= 0) { members[(std::size_t)l].push_back(all_g[j]); mem_cid[(std::size_t)l] = all_cid[j]; }
+        }
+        for (int l = 0; l < k; ++l) appendSeed(mem_cid[(std::size_t)l], members[(std::size_t)l]);
+        return;
+    }
+
+    // Fallback: one hdbscan<3> per class (the proven path, minus the maturity gate).
+    for (const auto& kv : by_class)
+        clusterClass(kv.first, kv.second);
+}
+
+double ObjectSeeds::hdbscanTimeOnly(const Universe& uni, const std::vector<int>& gidx,
+                                    const Params& p, int* out_clusters) {
+    if (out_clusters) *out_clusters = 0;
+    Universe::Cloud::ConstPtr cloud = uni.cloud();
+    if (!cloud || cloud->empty()) return 0.0;
+    const int min_pts = std::max(1, p.min_pts);
+    const int n = (int)gidx.size();
+    if (n <= min_pts || n < kHdbscanMinInput) return 0.0;   // too few points / hdbscan crash floor
+
+    // Build the xyz point set (hdbscan<3> takes a mutable sequence of doubles).
+    parlay::sequence<pargeo::point<3>> P(n);
+    for (int j = 0; j < n; ++j) {
+        const int g = gidx[j];
+        if (g < 0 || g >= (int)cloud->size()) { double z[3] = {0,0,0}; P[j] = pargeo::point<3>(z); continue; }
+        const Universe::PointT& pt = (*cloud)[g];
+        double xyz[3] = {pt.x, pt.y, pt.z};
+        P[j] = pargeo::point<3>(xyz);
+    }
+
+    CoutSilencer silence;                          // mute the lib's per-call cout spam
+    const auto t0 = std::chrono::steady_clock::now();
+    parlay::sequence<pargeo::wghEdge> E = pargeo::hdbscan<3>(P, (size_t)min_pts);
+    parlay::sequence<pargeo::dendroNode> dendro = pargeo::dendrogram(E, (size_t)n);
+    std::vector<LinkNode> linkage(dendro.size());
+    for (std::size_t r = 0; r < dendro.size(); ++r)
+        linkage[r] = LinkNode{(long)std::get<0>(dendro[r]), (long)std::get<1>(dendro[r]),
+                              std::get<2>(dendro[r]),        (long)std::get<3>(dendro[r])};
+    std::vector<int> labels = extractFlatClusters(linkage, n, p.min_cluster_size,
+                                                  p.allow_single_cluster);
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (out_clusters) {
+        int k = 0;
+        for (int l : labels) k = std::max(k, l + 1);
+        *out_clusters = k;
+    }
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }

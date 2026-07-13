@@ -28,8 +28,6 @@
 #include <cstdint>
 #include <vector>
 
-class PointFeatures;         // point_features.h (pulled in by the .cpp)
-
 // One over-segment: a spatially-connected cluster of universe points plus its
 // resolved semantic thing-class. `points` holds global indices into the Universe
 // map, so results lift straight back onto the world.
@@ -41,13 +39,18 @@ struct Superpoint {
     ClassKind        kind = ClassKind::Unknown;    // Thing or Unknown (never Stuff)
     float            confidence = 0.0f;            // winner fraction among thing-labeled members
 
-    // Mask3D-feature spread of the members: the trace of their feature covariance
-    // divided by the feature dimension (mean per-dimension variance). A per-superpoint
-    // feature-homogeneity score -- low => members are feature-consistent (likely one
-    // object part). Computed only over members that already have a feature; 0 when
-    // fewer than two do (variance undefined), with feat_count reporting how many did.
-    float            feat_dispersion = 0.0f;
-    int              feat_count = 0;               // # members that had a Mask3D feature
+    // SAI3D-style region affinity vector: per-thing-class member counts, indexed by the
+    // Universe SemanticVocabulary class id (size == semantics().size(); only thing ids are
+    // ever non-zero, stuff/unlabeled contribute nothing). Cosine similarity of these
+    // histograms is the growing affinity signal -- cheap (just the class tallies VCCS
+    // already gathers) and geometry-aware because VCCS now segments the FULL view, so one
+    // superpoint == one object's local surface.
+    std::vector<float> hist;
+
+    // Raw OV-DVIS++ instance ids observed on the members THIS frame (deduped, may be
+    // several -- one physical object often carries multiple stable ids). Consolidation
+    // bridges proposals whose ids share a co-touch group (see InstanceIdGraph).
+    std::vector<int> inst_ids;
 };
 
 class Superpoints {
@@ -64,14 +67,20 @@ public:
 
     // Re-segment the crop of `uni` within `radius` of `center` and REPLACE the list
     // with just that window's supervoxels (ephemeral -- nothing is carried over from
-    // the previous refresh). radius <= 0 falls back to the whole map. When `pf` is
-    // non-null, each superpoint also gets its Mask3D-feature dispersion (see Superpoint).
+    // the previous refresh). radius <= 0 falls back to the whole map.
     void refreshLocal(const Universe& uni, const float center[3], float radius,
-                      const Params& p, const PointFeatures* pf = nullptr);
+                      const Params& p);
 
     // Whole-map convenience: segment the entire world in one pass.
-    void refreshWhole(const Universe& uni, const Params& p,
-                      const PointFeatures* pf = nullptr);
+    void refreshWhole(const Universe& uni, const Params& p);
+
+    // Segment an EXPLICIT set of universe global indices (e.g. the visible/projected
+    // set of ONE view) instead of a radius crop, then REPLACE the list with that set's
+    // supervoxels. Same VCCS config + majority-rule semantics as refreshLocal; skips the
+    // uni.local() crop and feeds `gidx` straight in. Used by the per-view experiment (and
+    // the eventual per-view pipeline). Out-of-range indices are dropped.
+    void refreshFromIndices(const Universe& uni, const std::vector<int>& gidx,
+                            const Params& p);
 
     const std::vector<Superpoint>& list() const { return list_; }
     int  size() const { return static_cast<int>(list_.size()); }
@@ -87,6 +96,5 @@ private:
     // labels: labels[j] (1..k) is the supervoxel of crop point j, gidx[j] its
     // universe global index. Clears any previous contents (no cross-window merge).
     void buildFromCrop(const std::vector<int>& gidx, const std::vector<int>& labels,
-                       std::uint32_t k, const Universe& uni, const Params& p,
-                       const PointFeatures* pf);
+                       std::uint32_t k, const Universe& uni, const Params& p);
 };

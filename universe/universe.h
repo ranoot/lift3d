@@ -132,18 +132,25 @@ public:
                                std::vector<int>* global_indices = nullptr,
                                int zbuf_dilate = 0) const;
 
-    // ---- per-point semantics (grow-only, fused across views) -----------------
-    // Cast one vote for `class_name` on world point `global_idx` (an index into the
-    // map, e.g. from project()/projectLocal() global_indices). The name is interned
-    // into the shared registry; votes accumulate so a point observed in many frames
-    // resolves to its majority class. Out-of-range indices and empty names are no-ops.
-    void voteLabel(int global_idx, const std::string& class_name);
+    // ---- per-point semantics (PER-FRAME TRANSIENT) ---------------------------
+    // The label/instance-id a point carries is whatever the CURRENT frame's 2D
+    // segmentation projected onto it -- there is no cross-view vote accumulation.
+    // clearFrameLabels() resets every point to unlabeled (-1) at the start of a
+    // frame; setFrameLabel() then stamps the visible points from that frame's maps.
+    // Downstream stages run only on the current view's points, so they always read a
+    // fresh, current-frame label. (The old vote histogram is gone by design.)
+    void clearFrameLabels();
+    // Stamp world point `global_idx` with this frame's class + DVIS instance id. The
+    // class NAME is interned into the shared registry (so pointClassId returns a
+    // stable id); instance_id is the raw DVIS id (-1 = background). Out-of-range
+    // indices and empty names are no-ops (empty name leaves the point unlabeled).
+    void setFrameLabel(int global_idx, const std::string& class_name, int instance_id);
 
     // Fuse an observed RGB colour into world point `global_idx` (running mean, so a
     // point seen in many frames converges to its average colour). Colour is sampled
     // from the camera image during projection/voting and is NOT lidar-derived (the
-    // map is PointXYZI); it feeds the Mask3D backbone, which expects RGB. Out-of-range
-    // indices are no-ops. Channels are 0..255.
+    // map is PointXYZI); kept for RGB-consuming stages / viz. Out-of-range indices are
+    // no-ops. Channels are 0..255.
     void voteColor(int global_idx, unsigned char r, unsigned char g, unsigned char b);
     // Mean accumulated colour of point i into rgb[3] (0..255). Returns false if the
     // point has never been coloured (no camera ever saw it).
@@ -157,22 +164,11 @@ public:
     void declareVocab(const std::vector<std::string>& thing,
                       const std::vector<std::string>& stuff);
 
-    // Label gate: a point resolves to a class only if it has at least `min_votes`
-    // total votes AND the winning class holds at least `min_conf` of them (0..1).
-    // Points below the gate report as unlabeled (pointClassId == -1). This filters
-    // sparse/ambiguous points -- e.g. specular-reflection points that only leaked a
-    // handful of frustum votes -- without touching the stored histograms. Defaults
-    // (1, 0) reproduce the old ungated argmax. Confidence is unaffected by the gate.
-    void setLabelGate(int min_votes, float min_conf);
-    int   labelMinVotes() const { return min_votes_; }
-    float labelMinConf()  const { return min_conf_; }
-
-    // Resolved class for world point i = argmax of its vote histogram, subject to
-    // the label gate above.
-    int         pointClassId(int i)   const;   // stable registry id, -1 if unvoted/gated
-    std::string pointClassName(int i) const;   // "" if unvoted
-    float       pointClassConfidence(int i) const;  // winning_votes/total, 0 if unvoted
-    int         pointVoteTotal(int i) const;   // total votes cast on point i
+    // Current-frame class for world point i (the label last stamped by setFrameLabel;
+    // -1 if not seen this frame).
+    int         pointClassId(int i)   const;   // stable registry id, -1 if unlabeled
+    std::string pointClassName(int i) const;   // "" if unlabeled
+    int         pointInstanceId(int i) const;  // raw DVIS instance id this frame, -1 if none
     ClassKind   pointClassKind(int i) const;   // thing/stuff of the resolved class
     bool        pointIsThing(int i) const { return pointClassKind(i) == ClassKind::Thing; }
     bool        pointIsStuff(int i) const { return pointClassKind(i) == ClassKind::Stuff; }
@@ -183,9 +179,9 @@ public:
     // Mark a world point DEAD so every read-time enumeration skips it: local()
     // crops (hence projection candidates, features, superpoints, seeds), export,
     // and viz. The point KEEPS its index -- nothing is erased or reindexed -- so
-    // all downstream global indices (vox_, votes_, features, seeds/objects) stay
-    // valid; dead points are simply filtered wherever the world is read. Its vote
-    // histogram is cleared so it also reads as unlabeled if a caller forgets to
+    // all downstream global indices (vox_, features, seeds/objects) stay
+    // valid; dead points are simply filtered wherever the world is read. Its frame
+    // label is cleared so it also reads as unlabeled if a caller forgets to
     // skip it. Used to drop dynamic objects (people) that the wide-FOV lidar fused
     // but a camera later catches on a "dynamic" 2D segment. Out-of-range => no-op.
     // A later fuse into the same voxel REVIVES the slot (the geometry there changed),
@@ -211,8 +207,6 @@ private:
 
     float      voxel_;
     float      local_radius_ = 0.0f;          // 0 => local ops see the whole world
-    int        min_votes_ = 1;                // label gate: min total votes
-    float      min_conf_  = 0.0f;             // label gate: min winning fraction
     Cloud::Ptr map_;                          // persistent PointXYZI world (world frame)
     std::vector<int> count_;                  // per-point fusion count, parallel to map_
     std::vector<std::uint8_t> alive_;         // per-point tombstone (1=live), parallel to map_
@@ -220,17 +214,17 @@ private:
     std::vector<View> views_;
     float      last_robot_[3] = {0, 0, 0};    // most recent robot world position
 
-    // Per-point semantic vote histogram, parallel to map_ (grows with it). Sparse:
-    // each point holds only the (class_id,count) pairs it has actually seen, so
-    // memory is proportional to observed class diversity, and adding classes at
-    // runtime is free. Class ids index sem_ (stable across vocab changes).
+    // Per-point CURRENT-FRAME semantics, parallel to map_ (grow with it). Both are
+    // reset to -1 by clearFrameLabels() every frame and stamped by setFrameLabel()
+    // for the points the current view sees -- no cross-frame accumulation. flabel_
+    // holds a stable sem_ registry id; fiid_ holds the raw DVIS instance id.
     SemanticVocabulary                                sem_;
-    std::vector<std::vector<std::pair<uint16_t, uint16_t>>> votes_;
+    std::vector<int>                                  flabel_;   // -1 = unlabeled
+    std::vector<int>                                  fiid_;     // -1 = no instance
 
     // Per-point running-mean RGB (0..255) + observation count, parallel to map_.
-    // Populated from camera images during voting (see voteColor); the Mask3D backbone
-    // consumes it as its 3-channel colour input. color_[i] is meaningful only when
-    // color_n_[i] > 0.
+    // Populated from camera images during voting (see voteColor); kept for
+    // RGB-consuming stages / viz. color_[i] is meaningful only when color_n_[i] > 0.
     std::vector<std::array<float, 3>>                 color_;
     std::vector<std::uint32_t>                        color_n_;
 };

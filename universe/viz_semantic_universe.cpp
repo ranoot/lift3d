@@ -9,8 +9,7 @@
 // All parameters live in the YAML config (see run.yaml); the flags above are just
 // convenience overrides.
 //
-// Requires the inf_server running. The final segmented world map (and, with
-// --show-features, the per-point Mask3D feature colouring) is logged ONCE as a
+// Requires the inf_server running. The final segmented world map is logged ONCE as a
 // static snapshot (always visible at any time cursor); only the lightweight robot
 // pose / trajectory / camera / RGB frame vary per frame. This keeps the recording
 // small -- re-logging the whole world every frame made it O(frames x map_size)
@@ -20,18 +19,22 @@
 // can hide "stuff" (walls/floor/...) with one toggle in the viewer's entity tree
 // and keep just the objects. --things-only skips voting stuff classes entirely.
 //
-// With --superpoints, the VCCS oversegmentation is EPHEMERAL (one local window per
-// stride) and is logged ON THE TIMELINE at the strided frames where it is recomputed
-// -- NOT in the static snapshot -- so scrubbing shows only the current window, moving
-// with the robot. Under world/superpoints/*: /all colours each point by a palette
-// keyed on its per-window superpoint id, /things shows only object superpoints
-// coloured by class via the shared AnnotationContext, /centroids marks each object
-// superpoint's centre with its class-name label, and /window draws the wireframe crop
-// sphere (radius) the window was computed over, at the robot's position that frame.
+// With --superpoints, the VCCS oversegmentation is EPHEMERAL (recomputed per frame on the
+// per-view visible thing set) and is logged ON THE TIMELINE at each frame it is recomputed
+// -- NOT in the static snapshot -- so scrubbing shows only the current view's superpoints,
+// moving with the robot. Under world/superpoints/*: /all colours each point by a palette
+// keyed on its superpoint id, /things shows only object superpoints coloured by class via
+// the shared AnnotationContext, and /centroids marks each object superpoint's centre with
+// its class-name label.
+// The per-frame PROPOSALS (grown HDBSCAN seeds) are logged the same way under
+// world/proposals/*: /points colours every member point (grown, incl. absorbed boundary
+// geometry) by a palette keyed on the proposal's id and /centroids marks each proposal's
+// centre with its class name. Proposals are re-seeded + re-grown every frame (seeds +
+// superpoints => proposals, all within one view), so this layer is re-logged every frame
+// and REPLACES the prior frame's -- scrubbing shows only the current view's proposals.
 
 #include "universe.h"
 #include "superpoints.h"
-#include "point_features.h"
 #include "object_seeds.h"
 #include "objects.h"
 #include "run_config.h"
@@ -39,7 +42,6 @@
 #include "dog_stream.h"
 #include "dog_log_ingestor.h"
 #include "inf_client.h"
-#include "feat_client.h"
 #include "semantic_pipeline.h"
 #include "online_semantic.h"
 
@@ -126,8 +128,6 @@ int main(int argc, char** argv) {
     const std::string& log     = cfg.log;
     const std::string& calib   = cfg.calib;
     const int          cam_id  = cfg.cam;
-    const std::string& feat_endpoint = cfg.feat_endpoint;
-    const bool         show_features = cfg.show_features;
     const bool         spawn   = cfg.spawn;
     const std::string  out     = cfg.out;
 
@@ -141,17 +141,9 @@ int main(int argc, char** argv) {
         if (!inf.ping()) { std::fprintf(stderr, "inf_server not responding at %s\n",
                                         p.endpoint.c_str()); return 1; }
 
-        std::unique_ptr<FeatClient> feat;
-        if (p.features) {
-            feat.reset(new FeatClient(feat_endpoint));
-            if (!feat->ping()) { std::fprintf(stderr, "mask3d_feat not responding at %s\n",
-                                              feat_endpoint.c_str()); return 1; }
-        }
-
         Universe uni(p.voxel);
         uni.setLocalRadius(p.radius);
         Superpoints sp;
-        PointFeatures pf;
         ObjectSeeds os;
         Objects obj;
 
@@ -165,6 +157,18 @@ int main(int argc, char** argv) {
         const int start_img = std::min(p.start, reader.numImages() - 1);
         const std::int64_t t0 = reader.imageTimestamp(std::max(0, start_img));
         std::vector<rerun::datatypes::Vec3D> traj;
+
+        // EVERY per-frame proposal (tier-2 seed) accumulated across the whole run. The seed
+        // store is wiped each frame (seedFromIndices), so the only way to see all proposals at
+        // once is to snapshot their centroids in the frame hook (fired just after seeding, before
+        // the next frame clears the list). Logged static at the end as world/seeds/all_centroids.
+        // Distinct colour per proposal (global running index) so overlapping-but-separate
+        // proposals in one spot -- the signature of a merging failure -- are visibly distinct;
+        // sparse centroids where an object is missing signal a seeding/proposal gap instead.
+        std::vector<rerun::Position3D>       seed_ctr;
+        std::vector<rerun::Color>            seed_col;
+        std::vector<rerun::components::Text> seed_lbl;
+        std::uint32_t                        seed_running = 0;
 
         // Build the full segmented world + superpoints and log them, either as a
         // STATIC snapshot (as_static=true; logged once, always visible at any time
@@ -215,30 +219,19 @@ int main(int argc, char** argv) {
             // frames where VCCS actually recomputes (see logSuperpointsAt + the hook),
             // not baked into this always-visible static snapshot.
 
-            // Object SEEDS (tier 2, local HDBSCAN* clusters): a SECONDARY debug layer --
-            // small member points coloured by seed id, no centroid marker (the headline is
-            // the consolidated objects tier below). Static => always visible, no GC risk.
-            if (p.hdbscan && os.size() > 0) {
-                std::vector<rerun::Position3D> mpos;
-                std::vector<rerun::Color> mcol;
-                for (const ObjectSeed& s : os.list()) {
-                    const rerun::Color oc = superpointColor((std::uint32_t)s.id);
-                    for (int idx : s.points) {
-                        if (idx < 0 || idx >= (int)snap->size() || !uni.pointAlive(idx)) continue;
-                        const Universe::PointT& pt = (*snap)[idx];
-                        mpos.emplace_back(pt.x, pt.y, pt.z);
-                        mcol.push_back(oc);
-                    }
-                }
-                emit("world/seeds/points",
-                     rerun::Points3D(mpos).with_colors(mcol).with_radii(0.03f)
-                         .with_show_labels(false));
-            }
+            // NOTE: per-frame PROPOSALS (grown HDBSCAN seeds) are NOT logged here. Like the
+            // superpoints, they are ephemeral (re-seeded + re-grown per frame), so they are
+            // logged on the timeline at every frame under world/proposals/* (see
+            // logProposalsAt + the hook), replacing the prior frame -- not baked into this
+            // always-visible static snapshot. Only the run-wide proposal-centroid scatter
+            // (world/seeds/all_centroids) stays static; it is logged after the loop.
 
             // OBJECTS (tier 3, the primary output): the headline marker is a big
-            // class-coloured CENTROID per consolidated instance (centroid only -- no
+            // class-coloured CENTROID per promoted Union-Find component (centroid only -- no
             // bounding box, per the user), plus its member points coloured by the object's
-            // STABLE id (so a growing object keeps its colour; ids never shift).
+            // Union-Find root id. The colour is stable while a component stays intact; when
+            // two components merge, the union picks one root, so the merged object recolours
+            // once to the surviving root's colour (accepted -- objects are virtual).
             if (p.objects && obj.size() > 0) {
                 std::vector<rerun::Position3D> ctr, mpos;
                 std::vector<rerun::Color>               ctr_col;
@@ -263,61 +256,14 @@ int main(int argc, char** argv) {
                      rerun::Points3D(ctr).with_colors(ctr_col).with_labels(ctr_lbl)
                          .with_radii(0.15f));
             }
-
-            // Per-point Mask3D features under world/features: colour each point by a
-            // deterministic 96->3 random projection of its feature vector, min-max
-            // normalized to RGB. Not semantic -- similar colours ~ similar features, a
-            // quick visual check that the per-point embeddings carry object structure.
-            if (!show_features || pf.covered() == 0) return;
-            std::vector<float> W((std::size_t)pf.dim() * 3);
-            std::uint32_t s = 2463534242u;                 // fixed seed -> stable colours
-            auto nextw = [&]() {
-                s ^= s << 13; s ^= s >> 17; s ^= s << 5;   // xorshift32
-                return (float)((int)(s & 0x00ffffff) / 8388607.5 - 1.0);   // ~[-1,1]
-            };
-            for (float& w : W) w = nextw();
-            std::vector<rerun::Position3D> fpos;
-            std::vector<std::array<float, 3>> proj;
-            float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
-            for (int k = 0; k < (int)snap->size(); ++k) {
-                if (!uni.pointAlive(k)) continue;       // tombstoned -> no feature dot
-                const float* fv = pf.feature(k);
-                if (!fv) continue;
-                float pr[3] = {0, 0, 0};
-                for (int d = 0; d < pf.dim(); ++d) {
-                    pr[0] += fv[d] * W[(std::size_t)d * 3 + 0];
-                    pr[1] += fv[d] * W[(std::size_t)d * 3 + 1];
-                    pr[2] += fv[d] * W[(std::size_t)d * 3 + 2];
-                }
-                const Universe::PointT& pt = (*snap)[k];
-                fpos.emplace_back(pt.x, pt.y, pt.z);
-                proj.push_back({pr[0], pr[1], pr[2]});
-                for (int c = 0; c < 3; ++c) { mn[c] = std::min(mn[c], pr[c]); mx[c] = std::max(mx[c], pr[c]); }
-            }
-            std::vector<rerun::Color> fcol;
-            fcol.reserve(proj.size());
-            for (const auto& pr : proj) {
-                uint8_t rgb[3];
-                for (int c = 0; c < 3; ++c) {
-                    const float t = (mx[c] > mn[c]) ? (pr[c] - mn[c]) / (mx[c] - mn[c]) : 0.5f;
-                    rgb[c] = (uint8_t)(t * 255.0f);
-                }
-                fcol.emplace_back(rgb[0], rgb[1], rgb[2]);
-            }
-            emit("world/features",
-                 rerun::Points3D(fpos).with_colors(fcol).with_radii(0.02f)
-                     .with_show_labels(false));
         };
 
-        // Log the CURRENT ephemeral superpoint window on the timeline (at whatever time
-        // the caller has set). Called from the hook ONLY on the strided frames where
-        // VCCS just recomputed, so scrubbing shows the superpoints just at those points
-        // -- co-located with the robot and the crop radius where they were computed --
-        // rather than as one always-on global snapshot. Each call REPLACES the previous
-        // window (same entity paths + ephemeral list), so it never accumulates; the
-        // window then stays visible until the next recompute.
-        const float sp_r = p.sp_radius > 0.0f ? p.sp_radius : p.radius;
-        auto logSuperpointsAt = [&](const float robot[3]) {
+        // Log the CURRENT ephemeral superpoints on the timeline (at whatever time the caller
+        // has set). Called from the hook every frame VCCS recomputes, so scrubbing shows the
+        // per-view superpoints at that instant rather than one always-on global snapshot.
+        // Each call REPLACES the previous set (same entity paths + ephemeral list), so it
+        // never accumulates; the set stays visible until the next recompute.
+        auto logSuperpointsAt = [&]() {
             Universe::Cloud::ConstPtr snap = uni.cloud();
             std::vector<rerun::Position3D> sp_pos, th_pos, ctr_pos;
             std::vector<rerun::Color>      sp_col, th_col, ctr_col;
@@ -336,14 +282,8 @@ int main(int argc, char** argv) {
                 if (is_thing) {
                     ctr_pos.emplace_back(s.centroid[0], s.centroid[1], s.centroid[2]);
                     ctr_col.push_back(sc);
-                    // Label shown on hover/selection (click the sphere): class name plus
-                    // the Mask3D-feature dispersion attribute and how many members had a
-                    // feature (n=0 => features off or window not yet covered).
-                    char lbl[96];
-                    std::snprintf(lbl, sizeof(lbl), "%s | feat disp %.4f (n=%d)",
-                                  uni.semantics().name(s.class_id).c_str(),
-                                  s.feat_dispersion, s.feat_count);
-                    ctr_lbl.emplace_back(std::string(lbl));
+                    // Class name shown on hover/selection (click the sphere).
+                    ctr_lbl.emplace_back(uni.semantics().name(s.class_id));
                 }
             }
             rec.log("world/superpoints/all",
@@ -352,23 +292,50 @@ int main(int argc, char** argv) {
             rec.log("world/superpoints/things",
                     rerun::Points3D(th_pos).with_colors(th_col).with_radii(0.025f)
                         .with_show_labels(false));
-            // show_labels(false): the (now longer) label with the dispersion value is
-            // surfaced on hover / in the selection panel when you click the sphere,
-            // instead of floating permanently over every centroid.
+            // show_labels(false): the class-name label is surfaced on hover / in the
+            // selection panel when you click the sphere, instead of floating permanently
+            // over every centroid.
             rec.log("world/superpoints/centroids",
                     rerun::Points3D(ctr_pos).with_colors(ctr_col)
                         .with_labels(ctr_lbl).with_radii(0.08f)
                         .with_show_labels(false));
-            // The crop sphere the window was computed over, as a wireframe ellipsoid at
-            // the robot (skipped when radius<=0 => whole-map crop, i.e. no local window).
-            if (sp_r > 0.0f)
-                rec.log("world/superpoints/window",
-                        rerun::Ellipsoids3D::from_centers_and_radii(
-                            {{robot[0], robot[1], robot[2]}}, {sp_r})
-                            .with_fill_mode(rerun::components::FillMode::MajorWireframe)
-                            .with_colors({rerun::Color(255, 255, 0)}));
         };
         std::uint64_t last_sp_ver = sp.version();
+
+        // Log THIS frame's PROPOSALS (grown HDBSCAN seeds) on the timeline, mirroring
+        // logSuperpointsAt. Each proposal's member points (already grown by growLocal, incl.
+        // absorbed unlabeled/stuff boundary geometry) are coloured by a stable hash of the
+        // proposal's id -- one colour per proposal -- and its centroid gets a class-name
+        // label. The seed store is re-seeded + re-grown every frame, so this is called every
+        // frame and REPLACES the previous frame's entities (same paths); an empty log on a
+        // proposal-less frame clears the prior frame's points rather than leaving them stale.
+        auto logProposalsAt = [&]() {
+            Universe::Cloud::ConstPtr snap = uni.cloud();
+            std::vector<rerun::Position3D> pr_pos, ctr_pos;
+            std::vector<rerun::Color>      pr_col, ctr_col;
+            std::vector<rerun::components::Text> ctr_lbl;
+            for (const ObjectSeed& s : os.list()) {
+                const rerun::Color sc = superpointColor((std::uint32_t)s.id);
+                for (int idx : s.points) {
+                    if (idx < 0 || idx >= (int)snap->size() || !uni.pointAlive(idx)) continue;
+                    const Universe::PointT& pt = (*snap)[idx];
+                    pr_pos.emplace_back(pt.x, pt.y, pt.z);
+                    pr_col.push_back(sc);
+                }
+                ctr_pos.emplace_back(s.centroid[0], s.centroid[1], s.centroid[2]);
+                ctr_col.push_back(sc);
+                ctr_lbl.emplace_back(uni.semantics().name(s.class_id));
+            }
+            rec.log("world/proposals/points",
+                    rerun::Points3D(pr_pos).with_colors(pr_col).with_radii(0.035f)
+                        .with_show_labels(false));
+            // Class name surfaced on hover / in the selection panel (click the sphere),
+            // not floating permanently over every centroid.
+            rec.log("world/proposals/centroids",
+                    rerun::Points3D(ctr_pos).with_colors(ctr_col)
+                        .with_labels(ctr_lbl).with_radii(0.06f)
+                        .with_show_labels(false));
+        };
 
         // Per-frame hook: only the LIGHTWEIGHT, genuinely time-varying entities
         // (robot pose, trajectory, camera frustum, RGB frame) plus -- on the strided
@@ -401,14 +368,29 @@ int main(int argc, char** argv) {
                 // recomputed it (version bumped) this frame, anchored at this robot pos.
                 if (p.superpoints && sp.version() != last_sp_ver) {
                     last_sp_ver = sp.version();
-                    logSuperpointsAt(sf.robot);
+                    logSuperpointsAt();
+                }
+
+                // Proposals are re-seeded + re-grown every frame, so log them UNCONDITIONALLY
+                // each frame (not version-gated like superpoints): this replaces the prior
+                // frame's world/proposals/* and an empty log clears a proposal-less frame.
+                if (p.hdbscan) logProposalsAt();
+
+                // Snapshot THIS frame's proposals (the seed store is cleared next frame) into
+                // the run-wide aggregate, so world/seeds/all_centroids ends up holding every
+                // proposal ever made -- the coverage-vs-merging diagnostic.
+                if (p.hdbscan) {
+                    for (const ObjectSeed& s : os.list()) {
+                        seed_ctr.emplace_back(s.centroid[0], s.centroid[1], s.centroid[2]);
+                        seed_col.push_back(superpointColor(seed_running++));
+                        seed_lbl.emplace_back(uni.semantics().name(s.class_id));
+                    }
                 }
             };
 
         // Drive the SAME pipeline the headless runner uses; the visualizer is a pure
         // consumer (frame hook above). The offline ingestor feeds pushScan/pushImage.
         semantic::OnlineSemantic online(uni, inf, p, &sp,
-                                        p.features ? &pf : nullptr, feat.get(),
                                         p.hdbscan ? &os : nullptr,
                                         p.objects ? &obj : nullptr);
         online.setFrameHook(hook);
@@ -418,6 +400,12 @@ int main(int argc, char** argv) {
         ingestor.run(stream, p.start, p.count > 0 ? p.count : -1, p.stride);
         online.finish();
         int frames = online.frames();
+
+        // Viz-side rendering to rerun (legend + final static world snapshot) runs AFTER
+        // the pipeline's own end-of-run profile, so it is invisible to that report even
+        // though for viz it is often the single biggest cost. Time it here and print a
+        // matching "[timing]" line so every part of the viz run is accounted for.
+        semantic::Stopwatch viz_sw;
 
         // Static class legend: an AnnotationContext maps each class id -> name +
         // palette colour. Logged on "world" (an ancestor of world/map) so the points'
@@ -436,26 +424,42 @@ int main(int argc, char** argv) {
         rec.log_static("world", rerun::AnnotationContext(
             rerun::Collection<rerun::datatypes::ClassDescriptionMapElem>::take_ownership(
                 std::move(classes))));
+        const double t_legend = viz_sw.lap();
 
         // Final segmented world + superpoints as a STATIC snapshot: always visible at
         // any time cursor, logged once (no per-frame re-log => tiny recording).
         logWorld(true);
 
+        // All proposals from the whole run, as an always-visible static layer. Each is a
+        // small distinct-coloured dot at the proposal centroid (class name on hover); a dense
+        // clump that never became one object => merging problem, a bare region => proposal gap.
+        // Radius kept SMALL (below the object centroids' 0.15 and points' 0.045) so this
+        // run-wide scatter -- thousands of dots over a long run -- does not occlude the
+        // headline object markers; it is a separate entity you can also hide in the tree.
+        if (p.hdbscan && !seed_ctr.empty())
+            rec.log_static("world/seeds/all_centroids",
+                           rerun::Points3D(seed_ctr).with_colors(seed_col)
+                               .with_labels(seed_lbl).with_radii(0.035f)
+                               .with_show_labels(false));
+        const double t_world = viz_sw.lap();
+        std::fprintf(stderr,
+                     "[timing] viz render | legend %7.1f  static_world %9.1f ms | "
+                     "%.2f s total\n",
+                     t_legend, t_world, (t_legend + t_world) / 1000.0);
+
         std::printf("logged %d frames | world=%d points (%d live, %d tombstoned dynamic) "
                     "| %d classes | sink=%s\n",
                     frames, uni.size(), uni.aliveCount(), uni.size() - uni.aliveCount(),
                     sv.size(), spawn ? "spawn" : out.c_str());
-        if (p.features)
-            std::printf("features: %d/%d pts (%.1f%%) got a %d-d vector%s\n",
-                        pf.covered(), uni.size(),
-                        uni.size() ? 100.0 * pf.covered() / uni.size() : 0.0, pf.dim(),
-                        show_features ? " | shown at world/features" : "");
         if (p.hdbscan)
-            std::printf("object seeds (tier 2): %d instances | shown at world/seeds/points\n",
-                        os.size());
+            std::printf("object seeds (tier 2): %zu proposals total over %d frames | "
+                        "per-frame grown members at world/proposals/points (scrub the "
+                        "timeline), ALL proposal centroids at world/seeds/all_centroids\n",
+                        seed_ctr.size(), frames);
         if (p.objects)
-            std::printf("objects (tier 3): %d instances | shown at world/objects/{centroids,points}\n",
-                        obj.size());
+            std::printf("objects (tier 3): %d promoted (from %d seeds) | shown at "
+                        "world/objects/{centroids,points}\n",
+                        obj.size(), obj.seedCount());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

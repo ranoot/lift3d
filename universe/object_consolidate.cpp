@@ -1,216 +1,522 @@
 #include "objects.h"
-#include "point_features.h"     // PointFeatures
-#include "voxel_util.h"         // objutil::VKey/VHash/VSet, voxelOf, dist2, cosine, meanFeature
+#include "voxel_util.h"         // objutil::VKey/VHash/VSet, voxelOf, cosine
+#include "instance_ids.h"       // InstanceIdGraph::overlaps (2D co-touch id bonus)
 
-// The seeds -> objects consolidation stage (tier 2 -> tier 3). Parlay-free: reads only
-// Universe / ObjectSeeds / PointFeatures + std, so it stays clear of the heavy
-// hdbscan/parlay runtime and is unit-testable on its own. Mirrors object_grow.cpp's
-// affinity-merge shape, but scores by cosine * ADJACENCY (dilated overlap) instead of
-// containment, because disjoint seeds never share voxels with an existing object.
+// The proposals -> objects layer (tier 2 -> tier 3), as a single-tier Union-Find over a
+// persistent COMPONENT layer. Parlay-free: reads only Universe / ObjectSeeds + std. Each
+// per-frame proposal is matched, by voxel overlap, against the components that already own
+// its voxels; it joins (and progressively unions) every same-class component whose
+// CONTAINMENT clears that component's level-indexed bar, contributing only its NEW (unowned)
+// voxels and one unit of support. An "object" is virtual: a component whose support has
+// reached min_merges, synthesised from its aggregated voxel footprint. Geometry is stored
+// ONCE per component (deduped voxel -> representative gidx), not per observation, so memory
+// is bounded by the scene, not the run length; and only components touched can change, so
+// the per-frame rebuild scans components, never the full observation history.
+//
+// Two correctness properties this layer must keep:
+//   - Fresh-only claim: a proposal contributes ONLY its unowned voxels to the component it
+//     joins; voxels already owned by another component are overlap EVIDENCE, never stolen.
+//   - True containment: the merge bar is shared / min(|proposal|, |component|), so a large
+//     later full-view proposal can still be absorbed by a smaller established object.
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
-
-namespace {
 
 using objutil::VKey;
 using objutil::VHash;
-using objutil::VSet;
 using objutil::voxelOf;
-using objutil::dist2;
-using objutil::cosine;
-using objutil::meanFeature;
 
-// Transient per-object cache for one consolidate call over the in-radius objects.
-struct OCand {
-    int                oid = -1;
-    VSet               vox;                        // union of member-seed voxels (grows)
-    std::vector<float> feat;                       // mean Mask3D feature
-    float              centroid[3] = {0, 0, 0};
-    float              lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};  // AABB
-};
+// -- Union-Find over component ids --------------------------------------------------------
 
-// Fraction of `svox` whose voxels lie within Chebyshev distance K of any voxel in
-// `ovox` (K==0 => plain containment). Early-exits per seed voxel on first touch.
-float adjacencyFrac(const VSet& svox, const VSet& ovox, int K) {
-    if (svox.empty() || ovox.empty()) return 0.0f;
-    int hit = 0;
-    for (const VKey& v : svox) {
-        bool touch = false;
-        for (int dz = -K; dz <= K && !touch; ++dz)
-            for (int dy = -K; dy <= K && !touch; ++dy)
-                for (int dx = -K; dx <= K && !touch; ++dx)
-                    if (ovox.count(VKey{v.x + dx, v.y + dy, v.z + dz})) touch = true;
-        if (touch) ++hit;
-    }
-    return (float)hit / (float)svox.size();
+int Objects::find(int c) {
+    int r = c;
+    while (parent_[r] != r) r = parent_[r];
+    while (parent_[c] != r) { const int n = parent_[c]; parent_[c] = r; c = n; }  // compress
+    return r;
 }
 
-}  // namespace
+// Merge the component with FEWER voxels into the one with more (cheap), folding its voxel
+// map, class votes and support; the drained component's maps are cleared. Returns the root.
+int Objects::unite(int a, int b) {
+    a = find(a); b = find(b);
+    if (a == b) return a;
+    if (comp_[a].vox.size() < comp_[b].vox.size()) std::swap(a, b);
+    Comp& A = comp_[a];
+    Comp& B = comp_[b];
+    for (const auto& kv : B.vox) A.vox.emplace(kv.first, kv.second);  // emplace: on a shared voxel (overlap_sets) keep A's representative
+    for (const auto& kv : B.cls) A.cls[kv.first] += kv.second;
+    for (int id : B.ids)         A.ids.insert(id);
+    A.support += B.support;
+    B.vox.clear(); B.cls.clear(); B.ids.clear(); B.support = 0;
+    parent_[b] = a;
+    return a;
+}
 
-void Objects::consolidate(const Universe& uni, const ObjectSeeds& seeds,
-                          const PointFeatures& pf, const Params& g,
-                          const float center[3], float radius, float voxel) {
+// -- global_context helpers ---------------------------------------------------------------
+
+// Order-independent packed key for an edge between two component ids.
+std::uint64_t Objects::ekey(int a, int b) {
+    if (a > b) std::swap(a, b);
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(a)) << 32)
+         | static_cast<std::uint32_t>(b);
+}
+
+// Fraction of a component's voxels that fall in this frame's view set (SAI3D seg_seen);
+// 1.0 when no view is supplied (confidence weighting disabled).
+float Objects::visRatio(const Comp& c, const objutil::VSet* view) const {
+    if (!view || c.vox.empty()) return 1.0f;
+    int seen = 0;
+    for (const auto& kv : c.vox) if (view->count(kv.first)) ++seen;
+    return static_cast<float>(seen) / static_cast<float>(c.vox.size());
+}
+
+int Objects::newComp() {
+    const int id = static_cast<int>(parent_.size());
+    parent_.push_back(id);
+    comp_.emplace_back();
+    return id;
+}
+
+// -- Virtual object synthesis -------------------------------------------------------------
+
+void Objects::rebuildCache(const Universe& uni, const Params& g) {
+    cache_.clear();
     Universe::Cloud::ConstPtr cloud = uni.cloud();
     if (!cloud || cloud->empty()) return;
-    const std::vector<ObjectSeed>& slist = seeds.list();
-    if (slist.empty()) return;
 
-    const float inv = 1.0f / (voxel > 0.0f ? voxel : 0.05f);
-    const float r2  = radius > 0.0f ? radius * radius : 0.0f;
-    const float cr2 = g.cand_radius * g.cand_radius;
-    const int   K   = std::max(0, (int)std::lround(g.adj_dilate * inv));  // dilation in voxels
-
-    // Voxel set of a seed's member points.
-    auto seedVox = [&](const ObjectSeed& s, VSet& out) {
-        out.reserve(s.points.size());
-        for (int gi : s.points)
-            if (gi >= 0 && gi < (int)cloud->size())
-                out.insert(voxelOf((*cloud)[gi], inv));
-    };
-    // AABB of a seed's member points into c.lo/c.hi (returns false if it had none).
-    auto seedAabb = [&](const ObjectSeed& s, OCand& c) {
-        bool first = true;
-        for (int gi : s.points) {
-            if (gi < 0 || gi >= (int)cloud->size()) continue;
-            const Universe::PointT& p = (*cloud)[gi];
-            if (first) { c.lo[0]=c.hi[0]=p.x; c.lo[1]=c.hi[1]=p.y; c.lo[2]=c.hi[2]=p.z; first=false; }
-            else {
-                c.lo[0]=std::min(c.lo[0],p.x); c.hi[0]=std::max(c.hi[0],p.x);
-                c.lo[1]=std::min(c.lo[1],p.y); c.hi[1]=std::max(c.hi[1],p.y);
-                c.lo[2]=std::min(c.lo[2],p.z); c.hi[2]=std::max(c.hi[2],p.z);
+    // overlap_sets: components may share voxels. Resolve each voxel to the promoted component
+    // with the HIGHEST support (tie: larger voxel set, then lower id) so the synthesised
+    // objects are a clean disjoint partition even though the internal sets overlap.
+    if (g.overlap_sets) {
+        std::unordered_map<VKey, int, VHash> win;             // voxel -> winning root id
+        auto better = [&](int a, int b) -> bool {             // is root a a stronger owner than b?
+            const int sa = comp_[a].support, sb = comp_[b].support;
+            if (sa != sb) return sa > sb;
+            const std::size_t va = comp_[a].vox.size(), vb = comp_[b].vox.size();
+            if (va != vb) return va > vb;
+            return a < b;
+        };
+        for (int id = 0; id < static_cast<int>(comp_.size()); ++id) {
+            if (parent_[id] != id || comp_[id].support < g.min_merges) continue;
+            for (const auto& kv : comp_[id].vox) {
+                auto it = win.find(kv.first);
+                if (it == win.end())        win.emplace(kv.first, id);
+                else if (better(id, it->second)) it->second = id;
             }
         }
-        return !first;
-    };
-
-    // ---- cache every object with an in-radius centroid (mark it dirty so it re-derives
-    // this pass -- its member seeds may have grown via superpoints since last call) -----
-    std::vector<OCand>        cand;
-    std::vector<int>          obj_to_cand((std::size_t)list_.size(), -1);
-    std::vector<std::uint8_t> dirty((std::size_t)list_.size(), 0);
-    for (int oid = 0; oid < (int)list_.size(); ++oid) {
-        const Object& obj = list_[oid];
-        if (radius > 0.0f && dist2(obj.centroid, center) > r2) continue;
-        OCand c;
-        c.oid = oid;
-        c.centroid[0]=obj.centroid[0]; c.centroid[1]=obj.centroid[1]; c.centroid[2]=obj.centroid[2];
-        bool have = false;
-        for (int sid : obj.member_seeds) {
-            if (sid < 0 || sid >= (int)slist.size()) continue;
-            const ObjectSeed& s = slist[sid];
-            for (int gi : s.points)
-                if (gi >= 0 && gi < (int)cloud->size()) c.vox.insert(voxelOf((*cloud)[gi], inv));
-            OCand box; if (seedAabb(s, box)) {
-                if (!have) { std::copy(box.lo, box.lo+3, c.lo); std::copy(box.hi, box.hi+3, c.hi); }
-                else {
-                    for (int k=0;k<3;++k){ c.lo[k]=std::min(c.lo[k],box.lo[k]); c.hi[k]=std::max(c.hi[k],box.hi[k]); }
-                }
-                have = true;
+        for (int id = 0; id < static_cast<int>(comp_.size()); ++id) {
+            if (parent_[id] != id) continue;
+            const Comp& c = comp_[id];
+            if (c.support < g.min_merges) continue;
+            int best_c = -1, best_n = -1;
+            for (const auto& kv : c.cls) if (kv.second > best_n) { best_n = kv.second; best_c = kv.first; }
+            Object o;
+            o.id       = id;
+            o.class_id = best_c;
+            o.kind     = best_c >= 0 ? uni.semantics().kind(best_c) : ClassKind::Thing;
+            o.level    = c.support;
+            double s[3] = {0, 0, 0};
+            o.points.reserve(c.vox.size());
+            for (const auto& kv : c.vox) {
+                auto w = win.find(kv.first);
+                if (w == win.end() || w->second != id) continue;   // a stronger component won it
+                const int gid = kv.second;
+                if (gid < 0 || gid >= static_cast<int>(cloud->size())) continue;
+                if (!uni.pointAlive(gid)) continue;
+                const Universe::PointT& p = (*cloud)[gid];
+                s[0] += p.x; s[1] += p.y; s[2] += p.z;
+                o.points.push_back(gid);
             }
+            if (o.points.empty()) continue;
+            const double n = static_cast<double>(o.points.size());
+            o.centroid[0] = static_cast<float>(s[0] / n);
+            o.centroid[1] = static_cast<float>(s[1] / n);
+            o.centroid[2] = static_cast<float>(s[2] / n);
+            cache_.push_back(std::move(o));
         }
-        if (!have) continue;
-        // Object mean feature from the (disjoint) union of member-seed points.
-        std::vector<int> opts;
-        for (int sid : obj.member_seeds)
-            if (sid >= 0 && sid < (int)slist.size())
-                opts.insert(opts.end(), slist[sid].points.begin(), slist[sid].points.end());
-        c.feat = meanFeature(opts, pf);
-        obj_to_cand[oid] = (int)cand.size();
-        dirty[oid] = 1;                                  // re-derive in-radius objects
-        cand.push_back(std::move(c));
+        return;
     }
 
-    // ---- assign each still-unassigned, in-radius seed to the best object or a new one --
+    for (int id = 0; id < static_cast<int>(comp_.size()); ++id) {
+        if (parent_[id] != id) continue;                      // not a root (absorbed component)
+        const Comp& c = comp_[id];
+        if (c.support < g.min_merges) continue;               // not promoted yet -> hidden
+
+        int best_c = -1, best_n = -1;                         // majority component class
+        for (const auto& kv : c.cls) if (kv.second > best_n) { best_n = kv.second; best_c = kv.first; }
+
+        Object o;
+        o.id       = id;
+        o.class_id = best_c;
+        o.kind     = best_c >= 0 ? uni.semantics().kind(best_c) : ClassKind::Thing;
+        o.level    = c.support;
+        double s[3] = {0, 0, 0};
+        o.points.reserve(c.vox.size());
+        for (const auto& kv : c.vox) {
+            const int gid = kv.second;
+            if (gid < 0 || gid >= static_cast<int>(cloud->size())) continue;
+            if (!uni.pointAlive(gid)) continue;               // tombstoned (dynamic) -> skip
+            const Universe::PointT& p = (*cloud)[gid];
+            s[0] += p.x; s[1] += p.y; s[2] += p.z;
+            o.points.push_back(gid);
+        }
+        if (o.points.empty()) continue;
+        const double n = static_cast<double>(o.points.size());
+        o.centroid[0] = static_cast<float>(s[0] / n);
+        o.centroid[1] = static_cast<float>(s[1] / n);
+        o.centroid[2] = static_cast<float>(s[2] / n);
+        cache_.push_back(std::move(o));
+    }
+}
+
+// -- Per-frame fold-in --------------------------------------------------------------------
+
+void Objects::consolidate(const Universe& uni, const ObjectSeeds& seeds, const Params& g,
+                          float voxel, const objutil::VSet* view_vox, InstanceIdGraph* idg) {
+    Universe::Cloud::ConstPtr cloud = uni.cloud();
+    if (!cloud || cloud->empty()) return;
+    const std::vector<ObjectSeed>& props = seeds.list();
+    if (props.empty()) return;
+
+    const float inv  = 1.0f / (voxel > 0.0f ? voxel : 0.05f);
+    const bool  gc   = g.global_context;
+    const bool  ov   = g.overlap_sets;
+    const int   ncls = static_cast<int>(uni.semantics().size());
     bool changed = false;
-    for (int sid = 0; sid < (int)slist.size(); ++sid) {
-        if (seedOwner(sid) != -1) continue;              // already owned (monotonic)
-        const ObjectSeed& s = slist[sid];
-        if (radius > 0.0f && dist2(s.centroid, center) > r2) continue;
 
-        VSet svox; seedVox(s, svox);
-        if (svox.empty()) continue;
-        std::vector<float> sf = meanFeature(s.points, pf);
-        if (sf.empty()) continue;   // no feature yet -> defer (leave unassigned this pass)
+    // global_context bookkeeping: edges deposited this frame (gated after the loop), and a
+    // per-frame cache of each root's visible ratio so a big component is scanned at most once.
+    std::vector<std::uint64_t>     touched;
+    std::unordered_map<int, float> vis_cache;
 
-        int   best_oid = -1;
-        float best_cos = g.affinity_thresh;              // feature-similarity threshold
-        for (const OCand& c : cand) {
-            if (g.require_class && s.class_id >= 0 && s.class_id != list_[c.oid].class_id)
-                continue;
-            const bool near = dist2(s.centroid, c.centroid) <= cr2;
-            const bool in_box =
-                s.centroid[0] >= c.lo[0]-g.adj_dilate && s.centroid[0] <= c.hi[0]+g.adj_dilate &&
-                s.centroid[1] >= c.lo[1]-g.adj_dilate && s.centroid[1] <= c.hi[1]+g.adj_dilate &&
-                s.centroid[2] >= c.lo[2]-g.adj_dilate && s.centroid[2] <= c.hi[2]+g.adj_dilate;
-            if (!near && !in_box) continue;
-            // Geometric GATE: the seed must physically touch the object -- a fraction of
-            // its voxels within K of the object's. Adjacency is a boundary quantity (small
-            // for two comparable fragments), so it only ADMITS a candidate; it must not be
-            // multiplied into the score or the merge becomes unreachable.
-            if (adjacencyFrac(svox, c.vox, K) < g.adj_min) continue;
-            // Feature SCORE: among touching, class-matched objects pick the most similar.
-            const float cs = cosine(sf, c.feat);
-            if (cs >= best_cos) { best_cos = cs; best_oid = c.oid; }
+    for (const ObjectSeed& P : props) {
+        // 1. Voxel-dedup the proposal: one representative gidx per occupied voxel.
+        std::unordered_map<VKey, int, VHash> pv;
+        int maxg = -1;
+        for (int gi : P.points) {
+            if (gi < 0 || gi >= static_cast<int>(cloud->size())) continue;
+            pv.emplace(voxelOf((*cloud)[gi], inv), gi);
+            if (gi > maxg) maxg = gi;
         }
+        if (pv.empty()) continue;
+        ++total_obs_;
+        if (static_cast<int>(pt_owner_.size()) <= maxg)
+            pt_owner_.resize(static_cast<std::size_t>(maxg) + 1, -1);
 
-        if (best_oid >= 0) {
-            // Merge the seed into the winning object; grow that cand's voxels so later
-            // seeds this pass see the enlarged object.
-            assignSeed(sid, best_oid);
-            list_[best_oid].member_seeds.push_back(sid);
-            OCand& c = cand[obj_to_cand[best_oid]];
-            for (const VKey& v : svox) c.vox.insert(v);
-            dirty[best_oid] = 1;
-            changed = true;
+        // Class-majority guard: skip an overlap with a component whose dominant class differs.
+        auto passClass = [&](int r) -> bool {
+            if (!(g.require_class && P.class_id >= 0)) return true;
+            int cc = -1, best = -1;
+            for (const auto& cv : comp_[r].cls) if (cv.second > best) { best = cv.second; cc = cv.first; }
+            return !(cc >= 0 && cc != P.class_id);
+        };
+
+        // 2. Tally shared voxels per same-class component root, and collect the voxels this
+        //    proposal contributes to its home. Exclusive: `fresh` = the UNOWNED voxels (owned
+        //    ones are overlap evidence, never taken); owner located via the single-owner
+        //    pt_owner_ map. overlap_sets: EVERY voxel is contributed (non-exclusive), and
+        //    overlaps are located via the voxel->{components} index (distinct roots per voxel).
+        std::unordered_map<int, int> overlap;                 // component root -> shared voxels
+        std::vector<std::pair<VKey, int>> fresh;
+        fresh.reserve(pv.size());
+        if (!ov) {
+            for (const auto& kv : pv) {
+                const int gid = kv.second;
+                const int ow  = pt_owner_[gid];
+                if (ow < 0) { fresh.emplace_back(kv.first, gid); continue; }
+                const int r = find(ow);
+                if (passClass(r)) ++overlap[r];
+            }
         } else {
-            // Spawn a new object seeded by this one seed; register its cache so later
-            // seeds in this same pass can merge into it.
-            const int oid = (int)list_.size();
-            Object obj;
-            obj.id = oid; obj.class_id = s.class_id; obj.kind = s.kind;
-            obj.member_seeds.push_back(sid);
-            list_.push_back(std::move(obj));
-            assignSeed(sid, oid);
+            std::vector<int> roots;
+            for (const auto& kv : pv) {
+                fresh.emplace_back(kv.first, kv.second);       // all voxels join the home
+                auto it = pt_vox_.find(kv.first);
+                if (it == pt_vox_.end()) continue;
+                roots.clear();
+                for (int leaf : it->second) {                  // distinct roots for this voxel
+                    const int r = find(leaf);
+                    bool dup = false; for (int x : roots) if (x == r) { dup = true; break; }
+                    if (!dup) roots.push_back(r);
+                }
+                for (int r : roots) if (passClass(r)) ++overlap[r];
+            }
+        }
+        const int np = static_cast<int>(pv.size());
 
-            OCand c; c.oid = oid; c.vox = svox; c.feat = std::move(sf);
-            c.centroid[0]=s.centroid[0]; c.centroid[1]=s.centroid[1]; c.centroid[2]=s.centroid[2];
-            seedAabb(s, c);
-            obj_to_cand.push_back((int)cand.size());     // keep parallel to list_
-            dirty.push_back(1);
-            cand.push_back(std::move(c));
+        // Add `vs` to component `root`'s footprint. Exclusive: claim only voxels new to the
+        // component and record the single owner in pt_owner_. overlap_sets: add every voxel
+        // (a voxel may live in several components) and append `root` to its pt_vox_ owner list
+        // (deduped by resolved root). `root` is assumed to be a current Union-Find root.
+        auto claimVoxels = [&](int root, const std::vector<std::pair<VKey, int>>& vs) {
+            Comp& C = comp_[root];
+            for (const auto& f : vs) {
+                const bool isnew = C.vox.emplace(f.first, f.second).second;
+                if (!ov) { if (isnew) pt_owner_[f.second] = root; }
+                else {
+                    auto& owners = pt_vox_[f.first];
+                    bool present = false;
+                    for (int l : owners) if (find(l) == root) { present = true; break; }
+                    if (!present) owners.push_back(root);
+                }
+            }
+        };
+
+        // 3. Merge targets: same-class components whose CONTAINMENT (shared / min(|P|,|comp|))
+        //    clears that component's level bar (looser as it accumulates support).
+        int   primary = -1;
+        float best_c  = -1.0f;
+        std::vector<int> targets;
+        for (const auto& kv : overlap) {
+            const int   r     = kv.first;
+            const int   csize = static_cast<int>(comp_[r].vox.size());
+            const float cont  = static_cast<float>(kv.second)
+                              / static_cast<float>(std::max(1, std::min(np, csize)));
+            if (cont >= g.thresholdFor(comp_[r].support)) {
+                targets.push_back(r);
+                if (cont > best_c) { best_c = cont; primary = r; }
+            }
+        }
+
+        // 4a. LEGACY route (global_context off): union every cleared target immediately -- a
+        //     single frame's overlap can bridge two components. Byte-for-byte the old path.
+        if (!gc) {
+            int root;
+            if (primary >= 0) {
+                root = primary;
+                for (int t : targets) if (t != root) root = unite(root, t);   // progressive bridge
+            } else if (!fresh.empty()) {
+                root = newComp();
+            } else {
+                continue;
+            }
+            claimVoxels(root, fresh);
+            Comp& C = comp_[root];
+            C.cls[P.class_id] += np;
+            if (ov) for (int id : P.inst_ids) if (id >= 0) C.ids.insert(id);
+            C.support += 1;
+            changed = true;
+            continue;
+        }
+
+        // 4b. GRAPH route (global_context on): the proposal JOINS its single home component
+        //     (support + fresh voxels, as before) but does NOT itself union any other
+        //     component. Instead it DEPOSITS confidence-weighted affinity onto the edges from
+        //     its home to every other overlapped component -- the actual inter-object merge is
+        //     deferred to resolveMerges() once enough multi-view evidence has accumulated.
+        int home;
+        if      (primary  >= 0)   home = primary;    // best-containment cleared same-class comp
+        else if (!fresh.empty())  home = newComp();  // brand-new component from fresh voxels
+        else                      home = -1;         // nothing to join; still deposit evidence
+
+        // Deposit node: the home if it has one, else the highest-overlap component (so two
+        // components co-occurring in a proposal's footprint still accrue mutual evidence).
+        int rep = home;
+        if (rep < 0) { int bo = -1; for (const auto& kv : overlap) if (kv.second > bo) { bo = kv.second; rep = kv.first; } }
+
+        if (rep >= 0) {
+            // Visible ratio of the proposal this frame (fraction of its voxels in view).
+            float visP = 1.0f;
+            if (view_vox) {
+                int seen = 0;
+                for (const auto& kv : pv) if (view_vox->count(kv.first)) ++seen;
+                visP = np > 0 ? static_cast<float>(seen) / static_cast<float>(np) : 0.0f;
+            }
+            for (const auto& kv : overlap) {
+                const int C = kv.first;
+                if (C == rep) continue;                       // no self-edge
+
+                // Semantic similarity: cosine of the proposal's class histogram against the
+                // component's class-vote distribution (the signal the legacy path lacked).
+                float sim = 1.0f;
+                if (g.use_semantic_affinity && !P.hist.empty()
+                    && static_cast<int>(P.hist.size()) == ncls) {
+                    std::vector<float> ch(static_cast<std::size_t>(ncls), 0.0f);
+                    for (const auto& cv : comp_[C].cls)
+                        if (cv.first >= 0 && cv.first < ncls)
+                            ch[static_cast<std::size_t>(cv.first)] = static_cast<float>(cv.second);
+                    sim = objutil::cosine(P.hist, ch);
+                }
+                // 2D co-touch bonus: if the proposal and component share a DVIS instance-id
+                // group, boost similarity (activates InstanceIdGraph::overlaps).
+                if (g.use_instance_ids && idg && !P.inst_ids.empty() && !comp_[C].ids.empty()) {
+                    std::vector<int> cids(comp_[C].ids.begin(), comp_[C].ids.end());
+                    if (idg->overlaps(P.inst_ids, cids))
+                        sim = std::min(1.0f, sim + g.id_bonus);
+                }
+
+                // Geometric containment of the proposal in this component this frame
+                // (shared voxels / min(|P|,|comp|)), the same signal that gates the legacy
+                // path -- folded into the accumulated affinity so a proposal that merely
+                // grazes C contributes weak merge evidence even when its class matches. adj
+                // stays in [0,1] (sim, cont both in [0,1]) and is comparable to thresholdFor.
+                float cont = 1.0f;
+                if (g.use_containment) {
+                    const int csize = static_cast<int>(comp_[C].vox.size());
+                    cont = static_cast<float>(kv.second)
+                         / static_cast<float>(std::max(1, std::min(np, csize)));
+                }
+
+                // Confidence: product of the two primitives' visible ratios this frame.
+                float visC = 1.0f;
+                if (view_vox) {
+                    auto it = vis_cache.find(C);
+                    if (it == vis_cache.end()) { visC = visRatio(comp_[C], view_vox); vis_cache.emplace(C, visC); }
+                    else                       { visC = it->second; }
+                }
+                const float conf = visP * visC;
+                if (conf <= 0.0f) continue;
+
+                const std::uint64_t k = ekey(rep, C);
+                EdgeAcc& e = edges_[k];
+                e.sim_conf += sim * cont * conf;
+                e.conf     += conf;
+                touched.push_back(k);
+            }
+        }
+
+        // Join the home component: contribute its voxels + one unit of support + ids.
+        if (home >= 0) {
+            claimVoxels(home, fresh);
+            Comp& C = comp_[home];
+            C.cls[P.class_id] += np;
+            for (int id : P.inst_ids) if (id >= 0) C.ids.insert(id);
+            C.support += 1;
             changed = true;
         }
     }
 
-    // ---- re-derive points / mean feature / centroid for every dirtied object ----------
-    for (int oid = 0; oid < (int)list_.size(); ++oid) {
-        if (!dirty[oid]) continue;
-        Object& obj = list_[oid];
-        std::vector<int> pts;
-        for (int sid : obj.member_seeds)
-            if (sid >= 0 && sid < (int)slist.size())
-                pts.insert(pts.end(), slist[sid].points.begin(), slist[sid].points.end());
-        if (pts.size() != obj.points.size()) changed = true;   // seeds grew since last pass
-        obj.points = std::move(pts);
+    if (gc && !touched.empty()) changed = resolveMerges(touched, g) || changed;
+    if (changed) { ++version_; rebuildCache(uni, g); }
+}
 
-        double csum[3] = {0, 0, 0};
-        int nvalid = 0;
-        for (int gi : obj.points) {
-            if (gi < 0 || gi >= (int)cloud->size()) continue;
-            const Universe::PointT& p = (*cloud)[gi];
-            csum[0]+=p.x; csum[1]+=p.y; csum[2]+=p.z; ++nvalid;
+// -- global_context: gated, neighborhood-aggregated inter-component merge -----------------
+
+bool Objects::resolveMerges(const std::vector<std::uint64_t>& touched, const Params& g) {
+    // 1. Collapse the deposit-time edge store onto a ROOT-level adjacency snapshot.
+    std::unordered_map<std::uint64_t, EdgeAcc> radj;
+    for (const auto& e : edges_) {
+        int a = find(static_cast<int>(static_cast<std::uint32_t>(e.first >> 32)));
+        int b = find(static_cast<int>(static_cast<std::uint32_t>(e.first & 0xffffffffu)));
+        if (a == b) continue;                                 // internal edge (already merged)
+        EdgeAcc& r = radj[ekey(a, b)];
+        r.sim_conf += e.second.sim_conf;
+        r.conf     += e.second.conf;
+    }
+    if (radj.empty()) return false;
+
+    // Adjacency lists for the neighborhood aggregation (judge_connect).
+    std::unordered_map<int, std::vector<int>> nbr;
+    for (const auto& kv : radj) {
+        const int a = static_cast<int>(static_cast<std::uint32_t>(kv.first >> 32));
+        const int b = static_cast<int>(static_cast<std::uint32_t>(kv.first & 0xffffffffu));
+        nbr[a].push_back(b);
+        nbr[b].push_back(a);
+    }
+    auto adjOf = [&](int a, int b) -> float {
+        if (a == b) return 0.0f;
+        auto it = radj.find(ekey(a, b));
+        if (it == radj.end() || it->second.conf <= 0.0f) return 0.0f;
+        return it->second.sim_conf / it->second.conf;
+    };
+    // Region-aggregated affinity of A to B's whole neighborhood (B weighted full, its
+    // neighbors decayed), each weighted by voxel count -- SAI3D judge_connect.
+    auto region = [&](int A, int B) -> float {
+        double num = 0.0, den = 0.0;
+        const double w0 = static_cast<double>(std::max<std::size_t>(1, comp_[B].vox.size()));
+        num += w0 * adjOf(A, B); den += w0;
+        auto it = nbr.find(B);
+        if (it != nbr.end()) for (int K : it->second) {
+            if (K == A) continue;
+            const double w = g.dis_decay * static_cast<double>(std::max<std::size_t>(1, comp_[K].vox.size()));
+            num += w * adjOf(A, K); den += w;
         }
-        if (nvalid > 0) {
-            const double vinv = 1.0 / (double)nvalid;
-            obj.centroid[0]=(float)(csum[0]*vinv); obj.centroid[1]=(float)(csum[1]*vinv);
-            obj.centroid[2]=(float)(csum[2]*vinv);
-        }
-        obj.mean_feat = meanFeature(obj.points, pf);
+        return den > 0.0 ? static_cast<float>(num / den) : 0.0f;
+    };
+
+    // 2. Gate the edges touched this frame against the snapshot; collect surviving merges.
+    std::vector<std::pair<int, int>> merges;
+    std::unordered_set<std::uint64_t> seen;
+    for (std::uint64_t tk : touched) {
+        int a = find(static_cast<int>(static_cast<std::uint32_t>(tk >> 32)));
+        int b = find(static_cast<int>(static_cast<std::uint32_t>(tk & 0xffffffffu)));
+        if (a == b) continue;
+        const std::uint64_t rk = ekey(a, b);
+        if (!seen.insert(rk).second) continue;                // each root-pair once
+        auto it = radj.find(rk);
+        if (it == radj.end()) continue;
+        const EdgeAcc& e = it->second;
+        if (e.conf < g.min_evidence) continue;                // too little multi-view support
+        const float adj = e.conf > 0.0f ? e.sim_conf / e.conf : 0.0f;
+        const float bar = g.thresholdFor(std::min(comp_[a].support, comp_[b].support));
+        if (adj < bar) continue;                              // direct multi-view bar
+        if (region(a, b) < bar || region(b, a) < bar) continue;  // neighborhood must agree
+        merges.emplace_back(a, b);
     }
 
-    if (changed) ++version_;
+    // 3. Apply the surviving merges (computed from one snapshot; unions are associative).
+    bool merged = false;
+    for (const auto& m : merges)
+        if (find(m.first) != find(m.second)) { unite(m.first, m.second); merged = true; }
+
+    // 4. Recompact the edge store onto current roots (drop internal edges, coalesce dups).
+    if (merged) {
+        std::unordered_map<std::uint64_t, EdgeAcc> compact;
+        for (const auto& e : edges_) {
+            const int a = find(static_cast<int>(static_cast<std::uint32_t>(e.first >> 32)));
+            const int b = find(static_cast<int>(static_cast<std::uint32_t>(e.first & 0xffffffffu)));
+            if (a == b) continue;
+            EdgeAcc& r = compact[ekey(a, b)];
+            r.sim_conf += e.second.sim_conf;
+            r.conf     += e.second.conf;
+        }
+        edges_.swap(compact);
+    }
+    return merged;
+}
+
+// -- global_context: small-region cleanup (SAI3D merge_small_segs) ------------------------
+
+void Objects::mergeSmallComps(const Universe& uni, const Params& g) {
+    if (!g.global_context || g.small_seg_min <= 0) return;
+
+    bool merged   = false;
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        // Rebuild the root adjacency snapshot each sweep (roots change as we absorb).
+        std::unordered_map<std::uint64_t, EdgeAcc> radj;
+        for (const auto& e : edges_) {
+            const int a = find(static_cast<int>(static_cast<std::uint32_t>(e.first >> 32)));
+            const int b = find(static_cast<int>(static_cast<std::uint32_t>(e.first & 0xffffffffu)));
+            if (a == b) continue;
+            EdgeAcc& r = radj[ekey(a, b)];
+            r.sim_conf += e.second.sim_conf;
+            r.conf     += e.second.conf;
+        }
+        std::unordered_map<int, std::pair<int, float>> best;  // root -> (best neighbor, adj)
+        for (const auto& kv : radj) {
+            const int a = static_cast<int>(static_cast<std::uint32_t>(kv.first >> 32));
+            const int b = static_cast<int>(static_cast<std::uint32_t>(kv.first & 0xffffffffu));
+            const float v = kv.second.conf > 0.0f ? kv.second.sim_conf / kv.second.conf : 0.0f;
+            auto ba = best.find(a); if (ba == best.end() || v > ba->second.second) best[a] = {b, v};
+            auto bb = best.find(b); if (bb == best.end() || v > bb->second.second) best[b] = {a, v};
+        }
+        for (int id = 0; id < static_cast<int>(comp_.size()); ++id) {
+            if (parent_[id] != id) continue;                  // not a root
+            if (comp_[id].support >= g.small_seg_min) continue;
+            auto it = best.find(id);
+            if (it == best.end()) continue;                   // isolated -> leave as-is
+            const int tgt = find(it->second.first);
+            if (tgt == id) continue;
+            unite(id, tgt);
+            merged = true; progress = true;
+        }
+    }
+    if (merged) { ++version_; rebuildCache(uni, g); }
 }

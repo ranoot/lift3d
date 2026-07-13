@@ -121,8 +121,6 @@ endif()
 
 # inf_server IPC client: cppzmq (vendored) + a hand-rolled msgpack subset. Uses the
 # vendored zmq.h headers against the system libzmq runtime (no -dev package needed).
-# feat_client talks to the sibling mask3d_feat backbone server (per-point features).
-# Declared before `universe` so that library can link it (point_features.cpp calls it).
 find_library(ZMQ_LIBRARY NAMES zmq)
 if(NOT ZMQ_LIBRARY)
   file(GLOB _zmq_cand /usr/lib/x86_64-linux-gnu/libzmq.so.5* /usr/lib/libzmq.so.5*
@@ -136,7 +134,7 @@ if(NOT ZMQ_LIBRARY)
 endif()
 message(STATUS "inf_client using libzmq: ${ZMQ_LIBRARY}")
 
-add_library(inf_client STATIC inf_client/inf_client.cpp inf_client/feat_client.cpp)
+add_library(inf_client STATIC inf_client/inf_client.cpp)
 target_include_directories(inf_client
   PUBLIC inf_client
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cppzmq ${CMAKE_CURRENT_SOURCE_DIR}/libzmq/include)
@@ -144,11 +142,10 @@ target_link_libraries(inf_client PUBLIC ${ZMQ_LIBRARY})
 set_target_properties(inf_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Universe: PCL-backed world-space point accumulator + 2D<->3D projection bridge.
-# superpoints.cpp adds VCCS oversegmentation (pcl_segmentation, already in
-# PCL_LIBRARIES); point_features.cpp adds per-point Mask3D features (needs inf_client
-# for FeatClient -> the mask3d_feat backbone).
+# superpoints.cpp adds VCCS oversegmentation (pcl_segmentation, already in PCL_LIBRARIES).
 add_library(universe STATIC
-  universe/universe.cpp universe/superpoints.cpp universe/point_features.cpp)
+  universe/universe.cpp universe/superpoints.cpp
+  universe/instance_ids.cpp)
 target_include_directories(universe
   PUBLIC universe point_pixel_mapping)
 target_link_libraries(universe
@@ -174,7 +171,7 @@ set_target_properties(pargeo_hdbscan PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # is linked PRIVATE -- its heavy includes/defs build object_seeds.cpp but never leak to
 # the drivers (which still transitively link the static lib). object_grow.cpp (growing)
 # and object_consolidate.cpp (consolidation) stay parlay-free and read only the Universe/
-# Superpoints/PointFeatures headers (shared voxel math in voxel_util.h).
+# Superpoints headers (shared voxel math in voxel_util.h).
 add_library(object_seeds STATIC
   universe/object_seeds.cpp universe/object_grow.cpp universe/object_consolidate.cpp
   universe/hdbscan_extract.cpp)
@@ -202,9 +199,44 @@ target_link_libraries(viz_universe universe dog_log_adaptor ${PCL_LIBRARIES} rer
 # Semantic Universe: accumulate + lift inf_server 2D labels onto every world point.
 add_executable(run_semantic_universe universe/run_semantic_universe.cpp)
 target_link_libraries(run_semantic_universe
-  universe dog_log_adaptor inf_client object_seeds run_config ${PCL_LIBRARIES})
+  universe dog_log_adaptor inf_client object_seeds run_config gmd_adaptor gmd_types
+  ${PCL_LIBRARIES})
 
 # Rerun visualizer for the semantic map (world coloured by class + RGB frames).
 add_executable(viz_semantic_universe universe/viz_semantic_universe.cpp)
 target_link_libraries(viz_semantic_universe
   universe dog_log_adaptor inf_client object_seeds run_config ${PCL_LIBRARIES} rerun_sdk)
+
+# Per-view cost + DVIS id-overlap experiment (throwaway measurement; same link set as
+# run_semantic_universe -- parlay stays confined to object_seeds via hdbscanTimeOnly).
+add_executable(exp_per_view universe/exp_per_view.cpp)
+target_link_libraries(exp_per_view
+  universe dog_log_adaptor inf_client object_seeds run_config ${PCL_LIBRARIES})
+
+# ---------------------------------------------------------------------------------------
+# GMD deployment interface translation layer (real-robot RA message types -> DogStream).
+# Additive: nothing above is modified. gmd_types compiles only the OpenCV-free GMD entity
+# TUs (skips ImageUtils.cpp / PoseUtils.cpp, which need OpenCV); the adaptor + its test are
+# PCL/CUDA/server-free.
+# ---------------------------------------------------------------------------------------
+add_library(gmd_types STATIC
+  gmdDataTypesForInterns2/GMDBase/Entity/TimeStamp.cpp
+  gmdDataTypesForInterns2/Common/Entity/Transformation.cpp)
+target_include_directories(gmd_types PUBLIC gmdDataTypesForInterns2)
+target_link_libraries(gmd_types PUBLIC Eigen3::Eigen)
+set_target_properties(gmd_types PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(gmd_adaptor STATIC
+  gmd_adaptor/gmd_stream_adaptor.cpp
+  gmd_adaptor/object_publisher.cpp)
+target_include_directories(gmd_adaptor PUBLIC gmd_adaptor gmdDataTypesForInterns2)
+target_link_libraries(gmd_adaptor PUBLIC gmd_types dog_log_adaptor Eigen3::Eigen)
+set_target_properties(gmd_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Standalone translation-layer check (no PCL / GPU / servers).
+add_executable(gmd_stream_check tests/gmd_stream_check.cpp)
+target_link_libraries(gmd_stream_check gmd_adaptor gmd_types dog_log_adaptor Eigen3::Eigen)
+
+# Object egress check: EAIRoomObject 2D-hull publisher + keyed topic (no PCL / GPU / servers).
+add_executable(object_publisher_check tests/object_publisher_check.cpp)
+target_link_libraries(object_publisher_check gmd_adaptor gmd_types)

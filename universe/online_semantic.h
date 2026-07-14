@@ -12,16 +12,22 @@
 // DogStream::pushScan/pushImage. Visualizers and publishers attach as consumers via
 // setFrameHook / setObjectsHook and never touch the pipeline internals.
 //
+// OnlineSemantic OWNS its stages (Universe / InfClient / Superpoints / ObjectSeeds /
+// Objects), built from Params -- callers no longer wire them by hand. The input transport
+// is a pluggable FrameSource (offline LogFrameSource or live GmdFrameSource); attach() binds
+// its synced-frame output straight into onSynced.
+//
 // Usage:
-//   OnlineSemantic online(uni, inf, p, &sp, &os);
-//   online.setObjectsHook(publish);            // primary output
-//   DogStream stream(calib, online.hook());    // wire the synced-frame callback
+//   OnlineSemantic online(p);              // owns every stage; accessors expose them live
+//   online.setObjectsHook(publish);        // primary output
+//   LogFrameSource src(reader, calib);     // or GmdFrameSource(calib) for the live path
+//   online.attach(src);                    // route the source's synced frames into onSynced
 //   online.begin();
-//   ... drive stream.pushScan / stream.pushImage (live or ingestor) ...
-//   stream.flush();
+//   src.run(start, count, stride);         // or src.pushScan(...) / src.pushImage(...)
 //   online.finish();
 
 #include "semantic_pipeline.h"   // Params, stepFrameSynced, FrameHook, ObjectsHook, SyncedFrame
+#include "frame_source.h"        // FrameSource (attach binds its synced-frame hook)
 #include "voxel_util.h"          // objutil::VSet / voxelOf (consolidate view-voxel confidence)
 
 #include <cstdio>
@@ -33,20 +39,33 @@ namespace semantic {
 
 class OnlineSemantic {
 public:
-    // sp/os/obj are optional discovery stages (nullptr => that stage is off, same
-    // gating as the Params flags). uni/inf are borrowed for the pipeline's lifetime.
-    OnlineSemantic(Universe& uni, InfClient& inf, const Params& p,
-                   Superpoints* sp = nullptr, ObjectSeeds* os = nullptr,
-                   Objects* obj = nullptr)
-        : uni_(uni), inf_(inf), p_(p), sp_(sp), os_(os), obj_(obj) {}
+    // Owns every stage, built from Params: Universe(p.voxel) + setLocalRadius(p.radius),
+    // InfClient(p.endpoint), and default-constructed Superpoints/ObjectSeeds/Objects. Which
+    // discovery stages actually run is gated by the Params flags (p.superpoints/hdbscan/
+    // objects), not by their presence. Non-copyable (owns a non-copyable InfClient).
+    explicit OnlineSemantic(const Params& p)
+        : p_(p), uni_(p_.voxel), inf_(p_.endpoint) {
+        uni_.setLocalRadius(p_.radius);
+    }
 
     void setFrameHook(FrameHook h)     { on_frame_   = std::move(h); }
     void setObjectsHook(ObjectsHook h) { on_objects_ = std::move(h); }
 
-    // The DogStream synced-frame callback (bind once, pass to DogStream's ctor).
-    DogStream::SyncedHook hook() {
-        return [this](const SyncedFrame& sf) { onSynced(sf); };
+    // Route a FrameSource's time-synced frames into this pipeline. Call once before the
+    // source's first push (it builds the source's sync engine). The source is borrowed --
+    // it must outlive the run.
+    void attach(FrameSource& src) {
+        src_ = &src;
+        src.setSyncedHook([this](const SyncedFrame& sf) { onSynced(sf); });
     }
+
+    // Live-reference accessors for the owned stages (valid for the pipeline's lifetime) --
+    // drivers/visualizers read these instead of holding their own instances.
+    Universe&    universe()    { return uni_; }
+    InfClient&   inf()         { return inf_; }
+    Superpoints& superpoints() { return sp_; }
+    ObjectSeeds& seeds()       { return os_; }
+    Objects&     objects()     { return obj_; }
 
     // Prepare the tracker + vocabulary. Call once before the first pushed frame.
     void begin() {
@@ -62,11 +81,16 @@ public:
     // the consumer hook (fired AFTER any superpoint refresh so a visualizer sees the
     // current window for this frame).
     void onSynced(const SyncedFrame& sf) {
-        const bool  do_sp   = sp_ && p_.superpoints;
-        const bool  do_hdb  = os_ && p_.hdbscan;
-        // Growing needs superpoints + seeds; objects tier needs growing + its store.
+        const bool  do_sp   = p_.superpoints;
+        const bool  do_hdb  = p_.hdbscan;
+        // Growing needs superpoints + seeds; objects tier needs growing.
         const bool  do_grow = do_sp && do_hdb && p_.grow;
-        const bool  do_objects = do_grow && obj_ && p_.objects;
+        const bool  do_objects = do_grow && p_.objects;
+        // Fold proposals into the object layer only on the consolidation stride (frames
+        // 0, stride, 2*stride, ...) -- adjacent frames are near-duplicate views, so striding
+        // makes accumulated support reflect distinct viewpoints. <=1 => every frame.
+        const bool  do_consol = do_objects &&
+            (p_.consol_stride <= 1 || (done_ % p_.consol_stride) == 0);
         // Instance-guided seeding: only bother maintaining the DVIS id-bridge graph when
         // seeding will actually consult it (HDBSCAN on + the knob set).
         const bool  use_ids = do_hdb && p_.hdb.use_instance_ids;
@@ -99,28 +123,32 @@ public:
             if (uni_.pointIsThing(g)) active.push_back(g);
 
         Stopwatch sw;
-        double t_sp = 0, t_hdb = 0, t_grow = 0, t_consol = 0, t_hook = 0;
+        double t_sp = 0, t_hdb = 0, t_sor = 0, t_grow = 0, t_consol = 0, t_hook = 0;
         bool   objects_changed = false;
 
         // Per-frame discovery stack on `active`: seed -> superpoints -> grow -> consolidate.
         // Seeding runs FIRST so the seeds it births are growable + consolidatable this same
         // frame.
         if (do_hdb) {
-            os_->seedFromIndices(uni_, active, p_.hdb, use_ids ? &idg_ : nullptr);
-            prof_.add("hdbscan", t_hdb = sw.lap());
+            os_.seedFromIndices(uni_, active, p_.hdb, use_ids ? &idg_ : nullptr);
+            const double t_seed = sw.lap();          // whole seeding lap (SOR + clustering)
+            t_sor = os_.lastSorMs();                // SOR sub-cost, measured inside seeding
+            t_hdb = t_seed - t_sor;                  // clustering only -> the two sum to t_seed
+            prof_.add("sor",     t_sor);
+            prof_.add("hdbscan", t_hdb);
         }
         if (do_sp) {
             // VCCS over the FULL view (gidx: front-surface shell incl. unlabeled + stuff), NOT
             // just the thing subset -- so superpoints follow real surfaces and each one is a
             // single object's local geometry. The SAI3D class histogram (built in-superpoint)
             // then supplies the semantics.
-            sp_->refreshFromIndices(uni_, gidx, p_.sp);
+            sp_.refreshFromIndices(uni_, gidx, p_.sp);
             prof_.add("superpoints", t_sp = sw.lap());
         }
         if (do_grow) {
-            os_->growLocal(uni_, *sp_, p_.grow_p, p_.voxel);
+            os_.growLocal(uni_, sp_, p_.grow_p, p_.voxel);
             prof_.add("grow", t_grow = sw.lap());
-            if (do_objects) {
+            if (do_consol) {
                 // SAI3D global-context path: weight this frame's affinity deposits by how
                 // fully each primitive is seen -> build the frame's occupied-voxel shell from
                 // `gidx` (the front-surface set) and hand the DVIS id-bridge for the co-touch
@@ -138,7 +166,7 @@ public:
                     }
                 }
                 InstanceIdGraph* cidg = (gc && p_.consol_p.use_instance_ids) ? &idg_ : nullptr;
-                obj_->consolidate(uni_, *os_, p_.consol_p, p_.voxel,
+                obj_.consolidate(uni_, os_, p_.consol_p, p_.voxel,
                                   gc ? &view_vox : nullptr, cidg);
                 const double lc = sw.lap();
                 prof_.add("consolidate", lc);
@@ -147,7 +175,7 @@ public:
             }
         }
         // Publish the OBJECTS tier whenever it changed this frame (seed and/or grow).
-        if (objects_changed && on_objects_) on_objects_(obj_->list(), uni_);
+        if (objects_changed && on_objects_) on_objects_(obj_.list(), uni_);
         if (on_frame_) { on_frame_(done_, sf, m); prof_.add("hook", t_hook = sw.lap()); }
         ++done_;
 
@@ -155,13 +183,13 @@ public:
         // scan_dt is (attached scan time - image time); the camera pose used is
         // interpolated to image time regardless, so this is just visibility.
         // Show "done/total" when the target frame count is known (count > 0).
-        const double frame_ms = st.total() + t_sp + t_hdb + t_grow + t_consol + t_hook;
+        const double frame_ms = st.total() + t_sp + t_sor + t_hdb + t_grow + t_consol + t_hook;
         std::fprintf(stderr,
             "[timing] frame %s | img_t %lld scan_dt %+6.1fms | integ %6.1f  infer %6.1f  "
-            "proj %6.1f  vote %6.1f  sp %6.1f  hdb %6.1f  grow %6.1f  cons %6.1f  "
+            "proj %6.1f  vote %6.1f  sp %6.1f  sor %6.1f  hdb %6.1f  grow %6.1f  cons %6.1f  "
             "hook %6.1f | %7.1f ms\n",
             frameNo(done_).c_str(), (long long)sf.image_t, (double)(sf.scan_t - sf.image_t) / 1e6,
-            st.read_integrate, st.infer, st.project, st.vote, t_sp, t_hdb, t_grow,
+            st.read_integrate, st.infer, st.project, st.vote, t_sp, t_sor, t_hdb, t_grow,
             t_consol, t_hook, frame_ms);
     }
 
@@ -169,11 +197,11 @@ public:
     // stack now runs EVERY frame on the per-view set, so there is no separate whole-map
     // final pass -- the last onSynced already produced the final objects.
     void finish() {
-        const bool do_objects = obj_ && p_.objects && p_.hdbscan && p_.superpoints && p_.grow;
+        const bool do_objects = p_.objects && p_.hdbscan && p_.superpoints && p_.grow;
         // SAI3D merge_small_segs: one end-of-run cleanup pass that absorbs tiny components
         // into their best-affinity neighbor (no-op unless global_context + small_seg_min>0).
-        if (do_objects) obj_->mergeSmallComps(uni_, p_.consol_p);
-        if (do_objects && on_objects_) on_objects_(obj_->list(), uni_);
+        if (do_objects) obj_.mergeSmallComps(uni_, p_.consol_p);
+        if (do_objects && on_objects_) on_objects_(obj_.list(), uni_);
         char title[64];
         std::snprintf(title, sizeof(title), "run summary (%d frames)", done_);
         prof_.report(title, wall_.elapsed());
@@ -193,12 +221,16 @@ private:
         return b;
     }
 
-    Universe&      uni_;
-    InfClient&     inf_;
+    // Owned stages (declaration order = construction order; p_ first as uni_/inf_ read it).
     Params         p_;
-    Superpoints*   sp_;
-    ObjectSeeds*   os_;
-    Objects*       obj_;
+    Universe       uni_;
+    InfClient      inf_;
+    Superpoints    sp_;
+    ObjectSeeds    os_;
+    Objects        obj_;
+
+    // The attached input transport (borrowed; set in attach(), must outlive the run).
+    FrameSource*   src_ = nullptr;
 
     // Persistent DVIS instance-id bridge: unions same-class, physically-touching instance
     // ids across the run so instance-guided seeding groups by resolved (bridged) instance.

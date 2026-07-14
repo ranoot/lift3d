@@ -69,7 +69,7 @@ RunConfig loadRunConfig(const std::string& path) {
     p.sp.voxel_res  = p.voxel;                        // VCCS voxel ~ map voxel
 
     // hdbscan: { enabled, min_pts, min_cluster_size, min_class_points,
-    //            allow_single_cluster, single_scan }
+    //            allow_single_cluster, leaf_selection, single_scan }
     // Seeding runs EVERY frame on the per-frame visible thing set (no crop, no maturity
     // gate). Proposals are ephemeral: re-clustered each frame and fed to consolidation.
     YAML::Node hd = root["hdbscan"];
@@ -78,8 +78,13 @@ RunConfig loadRunConfig(const std::string& path) {
     p.hdb.min_cluster_size     = hd["min_cluster_size"].as<int>(d.hdb.min_cluster_size);
     p.hdb.min_class_points     = hd["min_class_points"].as<int>(d.hdb.min_class_points);
     p.hdb.allow_single_cluster = hd["allow_single_cluster"].as<bool>(d.hdb.allow_single_cluster);
+    p.hdb.leaf_selection       = hd["leaf_selection"].as<bool>(d.hdb.leaf_selection);
     p.hdb.single_scan          = hd["single_scan"].as<bool>(d.hdb.single_scan);
     p.hdb.use_instance_ids     = hd["use_instance_ids"].as<bool>(d.hdb.use_instance_ids);
+    // SOR pre-filter before the geometric HDBSCAN paths (drops sparse bridge points).
+    p.hdb.sor_enabled          = hd["sor_enabled"].as<bool>(d.hdb.sor_enabled);
+    p.hdb.sor_mean_k           = hd["sor_mean_k"].as<int>(d.hdb.sor_mean_k);
+    p.hdb.sor_std_mul          = hd["sor_std_mul"].as<float>(d.hdb.sor_std_mul);
 
     // grow: { enabled, affinity, require_class }. Absorbs this frame's superpoints into this
     // frame's proposals; affinity = cosine(class histograms) * containment (SAI3D).
@@ -104,6 +109,7 @@ RunConfig loadRunConfig(const std::string& path) {
     p.consol_p.merge_thresh  = ob["merge_thresh"].as<std::vector<float>>(d.consol_p.merge_thresh);
     p.consol_p.min_merges    = ob["min_merges"].as<int>(d.consol_p.min_merges);
     p.consol_p.require_class = ob["require_class"].as<bool>(d.consol_p.require_class);
+    p.consol_stride          = ob["consol_stride"].as<int>(d.consol_stride);
     // SAI3D global-context merging (opt-in): accumulate confidence-weighted affinity across
     // frames and gate inter-object merges on multi-view evidence + neighborhood aggregation.
     p.consol_p.global_context        = ob["global_context"].as<bool>(d.consol_p.global_context);

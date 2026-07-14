@@ -53,7 +53,8 @@ struct UF {
 }  // namespace
 
 std::vector<int> extractFlatClusters(const std::vector<LinkNode>& linkage, int n,
-                                     int min_cluster_size, bool allow_single_cluster) {
+                                     int min_cluster_size, bool allow_single_cluster,
+                                     bool leaf_selection) {
     std::vector<int> labels((std::size_t)std::max(0, n), -1);
     if (n <= 0 || linkage.empty()) return labels;
     if (min_cluster_size < 2) min_cluster_size = 2;
@@ -117,33 +118,43 @@ std::vector<int> extractFlatClusters(const std::vector<LinkNode>& linkage, int n
     for (const CRow& c : cond)
         stability[cidx(c.parent)] += (c.lambda - births[cidx(c.parent)]) * (double)c.size;
 
-    // ---- 3. EOM cluster selection -------------------------------------------
-    // Bottom-up (descending id): keep a cluster iff it is at least as stable as the
-    // sum of its selected descendants; otherwise defer to the descendants.
+    // ---- 3. Cluster selection (EOM or leaf) ---------------------------------
     std::vector<std::vector<long>> childClusters((std::size_t)ncl);
     for (const CRow& c : cond)
         if (c.child >= n) childClusters[cidx(c.parent)].push_back(c.child);
 
     std::vector<char> is_cluster((std::size_t)ncl, 1);
-    for (long cluster = next_label - 1; cluster >= n; --cluster) {
-        if (!allow_single_cluster && cluster == n) break;   // never select the root
-        const std::size_t k = cidx(cluster);
-        double sub = 0.0;
-        for (long ch : childClusters[k]) sub += stability[cidx(ch)];
-        if (sub > stability[k]) {
-            is_cluster[k] = 0;
-            stability[k] = sub;                    // propagate accumulated stability up
-        } else {                                   // select `cluster`, drop its descendants
-            std::queue<long> q;
-            for (long ch : childClusters[k]) q.push(ch);
-            while (!q.empty()) {
-                long d = q.front(); q.pop();
-                is_cluster[cidx(d)] = 0;
-                for (long ch : childClusters[cidx(d)]) q.push(ch);
+    if (leaf_selection) {
+        // LEAF: select exactly the condensed tree's leaf clusters -- those with no child
+        // clusters. This ignores stability and takes the finest split, so a would-be merged
+        // blob is returned as its constituent objects (more, smaller, homogeneous clusters).
+        for (long cluster = n; cluster < next_label; ++cluster)
+            is_cluster[cidx(cluster)] = childClusters[cidx(cluster)].empty() ? 1 : 0;
+        // The root is a leaf only when it never split (single cluster); honour the flag.
+        if (!allow_single_cluster) is_cluster[0] = 0;
+    } else {
+        // EOM (excess of mass), bottom-up (descending id): keep a cluster iff it is at least
+        // as stable as the sum of its selected descendants; otherwise defer to the descendants.
+        for (long cluster = next_label - 1; cluster >= n; --cluster) {
+            if (!allow_single_cluster && cluster == n) break;   // never select the root
+            const std::size_t k = cidx(cluster);
+            double sub = 0.0;
+            for (long ch : childClusters[k]) sub += stability[cidx(ch)];
+            if (sub > stability[k]) {
+                is_cluster[k] = 0;
+                stability[k] = sub;                // propagate accumulated stability up
+            } else {                               // select `cluster`, drop its descendants
+                std::queue<long> q;
+                for (long ch : childClusters[k]) q.push(ch);
+                while (!q.empty()) {
+                    long d = q.front(); q.pop();
+                    is_cluster[cidx(d)] = 0;
+                    for (long ch : childClusters[cidx(d)]) q.push(ch);
+                }
             }
         }
+        if (!allow_single_cluster) is_cluster[0] = 0;
     }
-    if (!allow_single_cluster) is_cluster[0] = 0;
 
     // Compact labels 0..K-1 for the selected clusters (ascending id).
     std::vector<int> compact((std::size_t)ncl, -1);

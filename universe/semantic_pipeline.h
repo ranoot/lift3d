@@ -40,7 +40,7 @@ inline std::vector<std::string> splitCsv(const std::string& s) {
     return out;
 }
 
-// DogFrame (world-lifted lidar) -> PointXYZI cloud, mirroring run_universe.
+// DogFrame (world-lifted lidar) -> PointXYZI cloud, mirroring run_semantic_universe.
 inline Universe::Cloud::Ptr frameToCloud(const DogFrame& f) {
     Universe::Cloud::Ptr c(new Universe::Cloud);
     const int N = (int)(f.points_world.size() / 3);
@@ -160,10 +160,18 @@ struct Params {
     // Objects tier (proposals -> objects): single-tier Union-Find over the persistent seed
     // layer -- each proposal is a seed, progressively unioned into the same-class components
     // it is contained in; objects are the VIRTUAL components promoted past min_merges. The
-    // pipeline's primary output. Runs every frame. Enabled iff `objects` AND grow.
+    // pipeline's primary output. Enabled iff `objects` AND grow.
     // `consol_p` holds the merge_thresh schedule + min_merges.
     bool  objects = false;
     Objects::Params consol_p;
+
+    // Consolidate only every `consol_stride` frames (a proposal is folded in on frames
+    // 0, stride, 2*stride, ...). Adjacent frames observe near-identical geometry, so folding
+    // every one inflates a component's support with tiny-baseline duplicates; striding samples
+    // genuinely distinct viewpoints, so `support`/`min_merges` reflects real multi-view
+    // evidence. Proposals on skipped frames are simply not folded (they are ephemeral anyway).
+    // <=1 => consolidate every frame (default, unchanged behavior).
+    int   consol_stride = 1;
 };
 
 // Per-frame hook (for viz / consumers): the synced-frame index, the SyncedFrame

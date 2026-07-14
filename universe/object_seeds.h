@@ -62,6 +62,12 @@ public:
         int  min_cluster_size = 50;    // flat-extraction strictness (smaller -> noise)
         int  min_class_points = 50;    // skip a class with fewer unclaimed points
         bool allow_single_cluster = true;  // let a single-object class resolve to 1 seed
+        // Flat-cluster selection: false => Excess-of-Mass (EOM, HDBSCAN* default: fewer,
+        // larger clusters, prefers stable parents). true => LEAF selection: take the
+        // condensed tree's leaf clusters instead, yielding more, smaller, more homogeneous
+        // proposals -- splits a would-be merged blob into its constituent objects. Trades
+        // recall for a finer segmentation; pair with a not-too-large min_cluster_size.
+        bool leaf_selection = false;
         // Maturity gate: a coarse cell of edge `maturity_res` (m) is clusterable only
         // once it holds >= `maturity_min` occupied fine voxels (map points). Keeps
         // HDBSCAN off half-observed, sparse geometry. (~2 m^3 default cell.) Used by
@@ -80,6 +86,16 @@ public:
         // bypassing single_scan/per-class HDBSCAN. Thing points with no instance id fall
         // back to per-class HDBSCAN. false => the pure-geometry paths above.
         bool  use_instance_ids = true;
+        // Statistical Outlier Removal (SOR) run on each class's point set BEFORE the
+        // geometric HDBSCAN paths (per-class hdbscan<3> and single_scan hdbscan<4>). For
+        // each point it takes the mean distance to its `sor_mean_k` nearest neighbors and
+        // drops any point whose mean exceeds mu + sor_std_mul*sigma (global mean/stddev),
+        // severing the thin sparse-point bridges that make HDBSCAN's MST fuse distinct
+        // objects. Off => byte-for-byte the current behaviour. Not applied to the
+        // instance-guided whole-group path (that bypasses geometric clustering).
+        bool  sor_enabled = false;
+        int   sor_mean_k  = 16;        // neighbors per point for the mean-distance estimate
+        float sor_std_mul = 1.0f;      // keep points with mean nbr dist <= mu + std_mul*sigma
         // Overlapping point-set model (mirrors Objects::Params::overlap_sets): when set, a
         // point is NOT removed from later clusters once claimed -- proposals may share points.
         // Off => the exclusive within-frame claim (byte-for-byte the current behaviour).
@@ -163,10 +179,16 @@ public:
     // Bumped on every seed/grow that changes the store (change detection for a viz).
     std::uint64_t version() const { return version_; }
 
+    // Wall time (ms) the most recent seedFromIndices() spent inside SOR pre-filtering,
+    // summed across classes. Lets the driver bill SOR as its own timing stage (subtracted
+    // from the seeding lap so hdbscan measures clustering only). 0 when SOR is disabled.
+    double lastSorMs() const { return last_sor_ms_; }
+
 private:
     std::vector<ObjectSeed> list_;             // persistent, append-only objects
     std::vector<int>        owner_;            // per map point: owning object id, or -1
     std::uint64_t           version_ = 0;
+    double                  last_sor_ms_ = 0.0; // SOR ms of the last seedFromIndices call
 
     // Claim map point `g` for object `oid`, growing owner_ as the map grows.
     void claim(int g, int oid) {

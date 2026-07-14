@@ -1,4 +1,4 @@
-#include "gmd_stream_adaptor.h"
+#include "gmd_frame_source.h"
 
 #include <chrono>
 #include <cstdio>
@@ -118,18 +118,18 @@ bool toDogImage(const Common::Entity::Image& img, DogImage& out) {
     return out.ok();
 }
 
-void GmdStreamAdaptor::pushScan(const Common::Entity::PrimaryPose& pose,
-                                const Common::Entity::PointCloud& cloud) {
+void GmdFrameSource::pushScan(const Common::Entity::PrimaryPose& pose,
+                              const Common::Entity::PointCloud& cloud) {
     double pose6[6];
     toPose6(pose, pose6);
     toPackedCloud(cloud, xyz_, inten_);
     const int n = static_cast<int>(xyz_.size() / 3);
     // Key on the cloud (scan) timestamp: DogStream uses this single t_ns both to register
     // the pose in the interpolator and to time-stamp the buffered scan (one pose per scan).
-    stream_.pushScan(toNanoseconds(cloud.timestamp), pose6, xyz_.data(), inten_.data(), n);
+    engine().pushScan(toNanoseconds(cloud.timestamp), pose6, xyz_.data(), inten_.data(), n);
 }
 
-void GmdStreamAdaptor::pushImage(const Common::Entity::Image& img) {
+void GmdFrameSource::pushImage(const Common::Entity::Image& img) {
     DogImage di;
     if (!toDogImage(img, di)) {
         ++dropped_images_;
@@ -140,7 +140,7 @@ void GmdStreamAdaptor::pushImage(const Common::Entity::Image& img) {
                      img.data.size());
         return;
     }
-    stream_.pushImage(di);
+    engine().pushImage(di);
 }
 
 } // namespace gmd

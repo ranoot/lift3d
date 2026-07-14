@@ -16,8 +16,7 @@
 #include "objects.h"
 #include "run_config.h"
 #include "dog_log_adaptor.h"
-#include "dog_stream.h"
-#include "dog_log_ingestor.h"
+#include "log_frame_source.h"   // LogFrameSource (offline replay; owns the DogStream engine)
 #include "inf_client.h"
 #include "semantic_pipeline.h"
 #include "online_semantic.h"
@@ -78,7 +77,8 @@ int main(int argc, char** argv) {
                         (int)p.grow_p.require_class);
         if (p.objects) {
             std::printf("objects (proposals->objects): seed Union-Find | min_merges=%d | "
-                        "require_class=%d | merge_thresh=[", p.consol_p.min_merges,
+                        "consol_stride=%d | require_class=%d | merge_thresh=[",
+                        p.consol_p.min_merges, p.consol_stride,
                         (int)p.consol_p.require_class);
             for (std::size_t i = 0; i < p.consol_p.merge_thresh.size(); ++i)
                 std::printf("%s%.2f", i ? "," : "", p.consol_p.merge_thresh[i]);
@@ -87,43 +87,36 @@ int main(int argc, char** argv) {
         if (p.hdbscan)
             std::printf("object proposals: per-frame seeding (visible thing set) | "
                         "min_pts=%d | min_cluster_size=%d | min_class_points=%d | "
-                        "instance_ids=%s\n",
+                        "select=%s | sor=%s(k=%d,s=%.1f) | instance_ids=%s\n",
                         p.hdb.min_pts, p.hdb.min_cluster_size, p.hdb.min_class_points,
+                        p.hdb.leaf_selection ? "leaf" : "eom",
+                        p.hdb.sor_enabled ? "on" : "off", p.hdb.sor_mean_k, p.hdb.sor_std_mul,
                         p.hdb.use_instance_ids ? "on (bridged DVIS instances)" : "off (geometry)");
         if (reader.size() == 0) return 1;
 
-        InfClient inf(p.endpoint);
-        if (!inf.ping()) { std::fprintf(stderr, "inf_server not responding at %s\n",
-                                        p.endpoint.c_str()); return 1; }
+        // OnlineSemantic OWNS the pipeline (Universe/InfClient/Superpoints/ObjectSeeds/
+        // Objects), built from Params. The offline LogFrameSource feeds it time-aligned
+        // SyncedFrames through the SAME interface a live GmdFrameSource would use. Objects
+        // (the primary output) are reported as discovered.
+        semantic::OnlineSemantic online(p);
+        if (!online.inf().ping()) { std::fprintf(stderr, "inf_server not responding at %s\n",
+                                                 p.endpoint.c_str()); return 1; }
 
-        Universe uni(p.voxel);
-        uni.setLocalRadius(p.radius);
-        Superpoints sp;
-        ObjectSeeds os;
-        Objects obj;
-
-        // Build the pipeline: OnlineSemantic consumes time-aligned SyncedFrames from
-        // DogStream (pose interpolated to each image timestamp). The offline
-        // DogLogIngestor feeds it through the SAME pushScan/pushImage interface a live
-        // driver would use. Objects (the primary output) are reported as discovered.
-        semantic::OnlineSemantic online(uni, inf, p, &sp,
-                                        p.hdbscan ? &os : nullptr,
-                                        p.objects ? &obj : nullptr);
-        // Publish objects to a ROS2-style keyed topic. Each universe Object becomes a
-        // Common::Entity::EAIRoomObject whose polygon is a 2D overhead (X-Y, world is Z-up) convex
-        // hull of its member points, cleaned with a kNN statistical-outlier pass. Re-publishing the
-        // same objectId overwrites the store; the sink reports every NEW / UPDATED object.
-        // NOTE: Object::id is a Union-Find root that can change when components merge, so upsert
+        // Bind live references to the owned stages for the post-run reads / hook below.
+        Universe&    uni = online.universe();
+        Superpoints& sp  = online.superpoints();
+        ObjectSeeds& os  = online.seeds();
+        Objects&     obj = online.objects();
+        // The objects hook returns the EAIRoomObjects to upsert into the global store: each
+        // universe Object becomes an EAIRoomObject whose polygon is a 2D overhead (X-Y, world is
+        // Z-up) convex hull of its member points, cleaned with a kNN statistical-outlier pass.
+        // Writing an objectId that already exists overwrites it (updated); a new id is created.
+        // NOTE: Object::id is a Union-Find root that can change when components merge, so id
         // stability is bounded by that root; a persistent id would come from the instance-id layer.
         const auto vehicle_id = static_cast<uint16_t>(cfg.cam);
-        gmd::ObjectTopic topic;
-        topic.setOnUpdate([](const gmd::EAIRoomObject& o, bool is_new) {
-            std::fprintf(stderr,
-                         "[objects] %s id=(veh %u) label=%s hull=%zu verts centroid=(%.2f,%.2f)\n",
-                         is_new ? "NEW" : "UPDATED", o.objectId.vehicleId, o.label.c_str(),
-                         o.polygon.size(), o.centroid.x, o.centroid.y);
-        });
-        online.setObjectsHook([&, vehicle_id](const std::vector<Object>& objs, const Universe& u) {
+        auto collectEAIObjects = [](const std::vector<Object>& objs, const Universe& u,
+                                    uint16_t vehicleId) {
+            std::vector<gmd::EAIRoomObject> updates;
             Universe::Cloud::ConstPtr cloud = u.cloud();
             std::vector<std::array<float, 3>> xyz;
             for (const Object& o : objs) {
@@ -136,18 +129,31 @@ int main(int argc, char** argv) {
                     xyz.push_back({pt.x, pt.y, pt.z});
                 }
                 if (xyz.empty()) continue;
-                topic.publish(gmd::buildRoomObject(vehicle_id, o.id,
-                                                   u.semantics().name(o.class_id), xyz));
+                updates.push_back(gmd::buildRoomObject(vehicleId, o.id,
+                                                       u.semantics().name(o.class_id), xyz));
             }
+            return updates;
+        };
+        gmd::ObjectDelta delta;  // remembers what was already emitted so we only send the changes
+        online.setObjectsHook([&, vehicle_id](const std::vector<Object>& objs, const Universe& u) {
+            std::vector<gmd::EAIRoomObject> all = collectEAIObjects(objs, u, vehicle_id);
+            std::vector<gmd::EAIRoomObject> updates = delta.changedSince(all);  // new or changed only
+            // Hand `updates` to the global object store (same objectId overwrites).
+            for (const gmd::EAIRoomObject& o : updates)
+                std::fprintf(stderr,
+                             "[objects] upsert id=(veh %u) label=%s hull=%zu verts "
+                             "centroid=(%.2f,%.2f)\n",
+                             o.objectId.vehicleId, o.label.c_str(), o.polygon.size(),
+                             o.centroid.x, o.centroid.y);
         });
 
-        DogStream stream(cam, online.hook());
+        LogFrameSource src(reader, cam);
+        online.attach(src);
         online.begin();
-        DogLogIngestor ingestor(reader);
         // p.start/p.count index IMAGES (5 Hz), not scans; each image's body pose is
         // interpolated to its capture time. p.stride sub-samples the image window
         // (every stride-th image is processed; scans stay dense for interpolation).
-        ingestor.run(stream, p.start, p.count > 0 ? p.count : -1, p.stride);
+        src.run(p.start, p.count > 0 ? p.count : -1, p.stride);
         online.finish();
         const int frames = online.frames();
 
@@ -156,8 +162,8 @@ int main(int argc, char** argv) {
                     frames, uni.size(), uni.aliveCount(), uni.size() - uni.aliveCount(),
                     uni.semantics().size());
         std::printf("sync: images pushed=%ld synced=%ld dropped(too_old=%ld overflow=%ld)\n",
-                    ingestor.imagesPushed(), stream.emitted(),
-                    stream.droppedTooOld(), stream.droppedOverflow());
+                    src.imagesPushed(), src.emitted(),
+                    src.droppedTooOld(), src.droppedOverflow());
 
         // Per-class point tally over the whole world (argmax of each point's votes),
         // split by thing/stuff so the object-vs-region breakdown is visible.

@@ -8,8 +8,8 @@
 //      it), and is a no-op on tiny inputs.
 //   4. buildRoomObject invariants: directionContent == "", roomId is NULL, objectId is stable
 //      across calls with the same id and differs for a different id, centroid near cluster center.
-//   5. ObjectTopic upsert/report semantics: first publish is NEW, identical re-publish is a silent
-//      no-op, a changed re-publish reports UPDATED, a second id grows the store.
+//   5. ObjectDelta returns only new/changed objects: first call returns all, an identical repeat
+//      returns none, a changed object returns just that one, a new id returns just the new one.
 //
 // Build (Eigen-free; no CMake needed):
 //   g++ -std=c++20 -I gmd_adaptor -I gmdDataTypesForInterns2 \
@@ -115,39 +115,41 @@ int main() {
         check(!gmd::nodeIdEqual(obj.objectId, obj_diff.objectId), "different object_id -> different id");
     }
 
-    // ---- 5. ObjectTopic upsert / update reporting -----------------------------------------------
+    // ---- 5. ObjectDelta returns only new/changed objects ----------------------------------------
     {
-        gmd::ObjectTopic topic;
-        int new_count = 0, upd_count = 0;
-        topic.setOnUpdate([&](const gmd::EAIRoomObject&, bool is_new) {
-            if (is_new) ++new_count; else ++upd_count;
-        });
+        std::vector<std::array<float, 3>> sq = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}};
+        gmd::ObjectDelta delta;
 
-        std::vector<std::array<float, 3>> xyz = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}};
-        auto a = gmd::buildRoomObject(211, 1, "door", xyz);
+        std::vector<gmd::EAIRoomObject> frame = {
+            gmd::buildRoomObject(211, 1, "door", sq),
+            gmd::buildRoomObject(211, 2, "table", sq),
+        };
+        auto d0 = delta.changedSince(frame);
+        check(d0.size() == 2, "first call returns all objects");
+        check(delta.trackedCount() == 2, "delta now tracks 2 ids");
 
-        check(topic.publish(a) == true, "first publish reports change");
-        check(new_count == 1 && upd_count == 0, "first publish is NEW");
-        check(topic.size() == 1, "store has 1 object");
+        // Identical frame -> nothing changed.
+        auto d1 = delta.changedSince(frame);
+        check(d1.empty(), "identical repeat returns no updates");
 
-        // Identical re-publish -> silent no-op.
-        check(topic.publish(a) == false, "identical re-publish is a no-op");
-        check(new_count == 1 && upd_count == 0, "no-op fires no callback");
-        check(topic.size() == 1, "store still has 1 object");
+        // Change object 2's geometry (a bigger footprint) -> only it comes back.
+        std::vector<std::array<float, 3>> big = {{0, 0, 0}, {2, 0, 0}, {2, 2, 0}, {0, 2, 0}};
+        frame[1] = gmd::buildRoomObject(211, 2, "table", big);
+        auto d2 = delta.changedSince(frame);
+        check(d2.size() == 1, "one changed object returns just that one");
+        check(!d2.empty() && d2[0].objectId.ident == frame[1].objectId.ident,
+              "the returned object is the changed one (id 2)");
 
-        // Changed object, same id -> UPDATED (overwrites in the global store).
-        auto a2 = a;
-        a2.label = "window";
-        check(topic.publish(a2) == true, "changed re-publish reports change");
-        check(upd_count == 1, "changed re-publish is UPDATED");
-        check(topic.size() == 1, "overwrite keeps store at 1 object");
-        check(topic.store().at(a.objectId).label == "window", "store holds the overwritten label");
+        // A relabel of object 1 is also a change.
+        frame[0].label = "window";
+        auto d3 = delta.changedSince(frame);
+        check(d3.size() == 1 && d3[0].label == "window", "a relabel counts as changed");
 
-        // A second id grows the store.
-        auto b = gmd::buildRoomObject(211, 2, "table", xyz);
-        check(topic.publish(b) == true, "new id publishes");
-        check(topic.size() == 2, "store grows to 2 objects");
-        check(new_count == 2, "second id is NEW");
+        // A brand-new id returns only the new one.
+        frame.push_back(gmd::buildRoomObject(211, 3, "chair", sq));
+        auto d4 = delta.changedSince(frame);
+        check(d4.size() == 1, "a new id returns just the new object");
+        check(delta.trackedCount() == 3, "delta now tracks 3 ids");
     }
 
     std::printf("%s\n", g_fails ? "FAILED" : "ALL PASS");

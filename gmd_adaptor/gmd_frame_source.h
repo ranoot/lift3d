@@ -1,31 +1,35 @@
 #pragma once
 // Translation layer: the robot's GMD deployment message types (Common::Entity::*,
-// supplied in gmdDataTypesForInterns2) -> the lift3d online semantic pipeline entry
-// points (DogStream::pushScan / pushImage). Nothing on either side is modified; this
-// only converts between them.
+// supplied in gmdDataTypesForInterns2) -> the lift3d online semantic pipeline. It is a
+// concrete FrameSource: it converts each incoming GMD message and forwards it to the
+// shared DogStream sync engine that FrameSource owns. Nothing on either side is modified;
+// this only converts between them.
 //
 // The robot's real-time stack publishes:
 //   Common::Entity::PrimaryPose  -- 6-DOF body pose in the robot-origin (world) frame
 //   Common::Entity::PointCloud   -- lidar points (ProcessedPoint) in the robot BODY frame
 //   Common::Entity::Image        -- camera frame (RGB8 / BGR8 / MONO8 / MONO16)
 //
-// The pipeline consumes:
-//   DogStream::pushScan(t_ns, pose6{x,y,z,r,p,y}, xyz_body*, intensity*, n)   ~10 Hz
-//   DogStream::pushImage(DogImage{HxWx3 row-major RGB, t_ns})                 ~5 Hz
+// The pipeline consumes time-synced frames; DogStream (inside FrameSource) performs the
+// pose interpolation + image/scan time alignment. Wire it in with:
+//   GmdFrameSource src(calib);
+//   online.attach(src);          // binds the synced-frame hook (see OnlineSemantic)
+//   online.begin();
+//   src.pushScan(pose, cloud);   // ~10 Hz   (native GMD types)
+//   src.pushImage(img);          // ~5 Hz
+//   src.flush();
+//   online.finish();
 //
-// This is the live-source analogue of DogLogIngestor (the offline replayer): instead of
-// replaying a ~/dog_logs recording, the caller hands each incoming GMD message straight
-// to the matching push* method here, and DogStream performs the pose interpolation +
-// image/scan time alignment exactly as it does for the offline path. Wire a DogStream to
-// OnlineSemantic's hook as usual, then drive it through a GmdStreamAdaptor.
+// This is the live-source analogue of LogFrameSource (the offline replayer): instead of
+// replaying a ~/dog_logs recording, the caller hands each incoming GMD message straight to
+// the matching push* method here, and the same downstream path runs.
 //
 // Conventions that must hold for the sync to be correct (they match the dog-log path):
 //  * PrimaryPose is body->world (the robot's pose in the origin frame); its
 //    {x,y,z,roll,pitch,yaw} map directly onto pose6, whose extrinsic-XYZ euler
 //    (R = Rz(yaw)Ry(pitch)Rx(roll)) is the same convention Transformation() uses.
 //  * PointCloud points are in the BODY frame; DogStream lifts them to world with the
-//    paired pose. Each scan carries exactly one pose, keyed on the scan (cloud)
-//    timestamp -- the same contract the MLOAMC scan format encodes.
+//    paired pose. Each scan carries exactly one pose, keyed on the scan (cloud) timestamp.
 //  * All timestamps are Common::Entity::TimeStamp (system_clock), which the robot keeps
 //    time-synced across computers, so pose/cloud and image share one clock -- which is
 //    exactly what DogStream needs to bracket each image between two poses.
@@ -38,8 +42,8 @@
 #include "Common/Entity/PrimaryPose.h"
 #include "GMDBase/Entity/TimeStamp.h"
 
-#include "dog_log_adaptor.h"   // DogImage, CameraCalib, Camera
-#include "dog_stream.h"        // DogStream
+#include "frame_source.h"      // FrameSource (owns the DogStream sync engine)
+#include "dog_log_adaptor.h"   // DogImage
 
 #include <cstdint>
 #include <vector>
@@ -71,15 +75,15 @@ void toPackedCloud(const Common::Entity::PointCloud& cloud,
 // data buffer too small for the declared width/height/step.
 bool toDogImage(const Common::Entity::Image& img, DogImage& out);
 
-// --- the streaming adaptor -----------------------------------------------------------
+// --- the streaming source ------------------------------------------------------------
 
-// Thin, stateful bridge over a DogStream. Construct the DogStream (with its synced-frame
-// hook already wired to OnlineSemantic) elsewhere, then feed each incoming GMD message to
-// the matching method here. Scratch buffers are reused across scans to avoid per-frame
-// allocation. Single-threaded, mirroring DogStream (call from one ingest thread).
-class GmdStreamAdaptor {
+// Concrete FrameSource over the robot's GMD messages. Construct with the camera calib,
+// attach it to an OnlineSemantic (which binds the synced-frame hook), then feed each
+// incoming GMD message to the matching method here. Scratch buffers are reused across
+// scans to avoid per-frame allocation. Single-threaded (call from one ingest thread).
+class GmdFrameSource : public FrameSource {
 public:
-    explicit GmdStreamAdaptor(DogStream& stream) : stream_(stream) {}
+    explicit GmdFrameSource(CameraCalib calib) : FrameSource(std::move(calib)) {}
 
     // One lidar observation: the body->world pose at the scan instant + the body-frame
     // cloud captured then. Keyed on the cloud's timestamp (the scan time), so the pose is
@@ -91,13 +95,9 @@ public:
     // unsupported or the buffer is inconsistent with the declared size.
     void pushImage(const Common::Entity::Image& img);
 
-    // Forward end-of-stream to the DogStream (drains any still-bracketable pending image).
-    void flush() { stream_.flush(); }
-
     long droppedImages() const { return dropped_images_; }
 
 private:
-    DogStream&                 stream_;
     std::vector<float>         xyz_;    // reused scan scratch
     std::vector<unsigned char> inten_;  // reused scan scratch
     long                       dropped_images_ = 0;

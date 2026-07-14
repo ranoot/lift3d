@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace gmd {
 
@@ -127,33 +128,47 @@ EAIRoomObject buildRoomObject(uint16_t vehicleId, int object_id, std::string lab
     return obj;
 }
 
-bool sameRoomObject(const EAIRoomObject& a, const EAIRoomObject& b, float eps) {
-    if (a.label != b.label) return false;
-    if (a.directionContent != b.directionContent) return false;
-    if (!nodeIdEqual(a.roomId, b.roomId)) return false;
-    if (std::fabs(a.centroid.x - b.centroid.x) > eps ||
-        std::fabs(a.centroid.y - b.centroid.y) > eps)
-        return false;
-    if (a.polygon.size() != b.polygon.size()) return false;
-    for (std::size_t i = 0; i < a.polygon.size(); ++i) {
-        if (std::fabs(a.polygon[i].x - b.polygon[i].x) > eps ||
-            std::fabs(a.polygon[i].y - b.polygon[i].y) > eps)
-            return false;
-    }
-    return true;
+namespace {
+// Pack an EAINodeId into a single 64-bit key (vehicleId in the high bits, ident tick below).
+std::uint64_t nodeIdKey(const EAINodeId& n) {
+    return (static_cast<std::uint64_t>(n.vehicleId) << 48) ^
+           static_cast<std::uint64_t>(n.ident.time_since_epoch().count());
 }
-
-bool ObjectTopic::publish(const EAIRoomObject& obj) {
-    auto it = store_.find(obj.objectId);
-    if (it == store_.end()) {
-        store_.emplace(obj.objectId, obj);
-        if (on_update_) on_update_(obj, /*is_new=*/true);
-        return true;
+void hashCombine(std::size_t& h, std::size_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+}
+std::size_t hashFloat(float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));  // hash the exact bits: same input -> same fingerprint
+    return std::hash<std::uint32_t>{}(u);
+}
+// Fingerprint of the fields a downstream store cares about (everything but objectId itself).
+std::size_t fingerprint(const EAIRoomObject& o) {
+    std::size_t h = std::hash<std::string>{}(o.label);
+    hashCombine(h, std::hash<std::string>{}(o.directionContent));
+    hashCombine(h, std::hash<std::uint64_t>{}(nodeIdKey(o.roomId)));
+    hashCombine(h, hashFloat(o.centroid.x));
+    hashCombine(h, hashFloat(o.centroid.y));
+    for (const Point2Df& p : o.polygon) {
+        hashCombine(h, hashFloat(p.x));
+        hashCombine(h, hashFloat(p.y));
     }
-    if (sameRoomObject(it->second, obj)) return false;  // identical re-publish -> no-op
-    it->second = obj;
-    if (on_update_) on_update_(obj, /*is_new=*/false);
-    return true;
+    return h;
+}
+}  // namespace
+
+std::vector<EAIRoomObject> ObjectDelta::changedSince(const std::vector<EAIRoomObject>& objects) {
+    std::vector<EAIRoomObject> out;
+    for (const EAIRoomObject& o : objects) {
+        const std::uint64_t key = nodeIdKey(o.objectId);
+        const std::size_t fp = fingerprint(o);
+        auto it = seen_.find(key);
+        if (it == seen_.end() || it->second != fp) {  // new id, or fingerprint changed
+            seen_[key] = fp;
+            out.push_back(o);
+        }
+    }
+    return out;
 }
 
 }  // namespace gmd

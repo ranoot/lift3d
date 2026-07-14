@@ -4,32 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`lift3d` is a CUDA/C++ project for 2D↔3D lifting. The core module implements the
-**point-to-pixel mapping from SGS-3D** (arXiv:2509.05144v2): it projects a world-space
-point cloud into a camera image, reconstructs visibility from the cloud itself with a
-z-buffer (no depth sensor needed), and emits a per-point correspondence map.
+`lift3d` is a CUDA/C++ project for online 2D→3D semantic mapping. A quadruped streams
+LiDAR + poses + camera images; the pipeline fuses the LiDAR into a persistent world point
+map ("the Universe"), lifts open-vocabulary 2D segmentation onto every 3D point via a
+z-buffered point-to-pixel projection, and discovers object instances (VCCS superpoints →
+HDBSCAN* seeds → consolidated objects). The overall structure follows **SGS-3D**
+(arXiv:2509.05144v2), adapted to be online and grow-only. `doc.md` is the full design +
+operations reference; read it before extending the pipeline. The `point_pixel_mapping`
+module (the SGS-3D lifting core) is intentionally PCL-free so any front end can reuse it.
 
 ## Build & run
 
 ```bash
 # nvcc must be on PATH (see gotcha below)
 export PATH=/usr/local/cuda/bin:$PATH
-cmake -S . -B build        # ~6 min: PCL/VTK detection dominates configure time
-cmake --build build -j
-./build/demo_mapping       # point-to-pixel demo (needs a working GPU)
-./build/pcd_write_test     # PCL starter, writes test_pcd.pcd
+# CPU back end (default): builds without a GPU.
+cmake -S . -B build && cmake --build build -j    # ~6 min configure: PCL/VTK probing
+# CUDA back end: separate build dir so the two don't clobber each other.
+cmake -S . -B build-cuda -DLIFT3D_USE_CUDA=ON && cmake --build build-cuda -j2
+
+# The two GPU-free smoke tests (no PCL / inf_server / GPU needed):
+./build-cuda/gmd_stream_check        # GMD->pipeline sync/lift/pixel translation
+./build-cuda/object_publisher_check  # object egress (2D hull + keyed topic)
+# The full pipeline (needs both Python IPC servers up — see doc.md §2):
+./build-cuda/run_semantic_universe --config run.yaml
+./build-cuda/viz_semantic_universe --config run.yaml --spawn   # rerun viz
 ```
 
 Override the GPU target when you know the card: `-DCMAKE_CUDA_ARCHITECTURES=86`.
-There is no test framework wired up yet; `demo_mapping` is the smoke test.
+`gmd_stream_check`/`object_publisher_check` are the quick smoke tests.
 
 ## Gotchas (read before debugging)
 
-- **The GPU does not run here.** This is WSL2 with a broken GPU passthrough:
-  `nvidia-smi` fails (`Failed to initialize NVML`) and CUDA programs fail at runtime
-  with *"CUDA driver version is insufficient for CUDA runtime version"*. `nvcc`
-  **compiles** fine; kernels just can't execute until the *Windows-host* NVIDIA driver
-  and `wsl --update` are refreshed. Verify CUDA changes by compiling, not running.
+- **The GPU runs, but WSL passthrough is intermittent (host-side).** The RTX 2080 Ti
+  *does* execute CUDA here when passthrough is healthy; when it isn't, `nvidia-smi` fails
+  (`Failed to initialize NVML`) and CUDA programs fail at runtime with *"CUDA driver
+  version is insufficient…"* — a *Windows-host* NVIDIA driver + `wsl --update` refresh
+  recovers it (restart the IPC servers afterward). `nvcc` always **compiles** regardless,
+  so verify CUDA changes by compiling; don't assume you can run without checking passthrough.
   **Never install a Linux NVIDIA driver inside WSL** — it breaks passthrough further.
 - **`nvcc` is not on PATH by default.** The toolkit lives at `/usr/local/cuda` but the
   installer doesn't export its `bin/`. `~/.bashrc` sets `CUDA_HOME`/`PATH`/`LD_LIBRARY_PATH`;
@@ -53,8 +65,8 @@ There is no test framework wired up yet; `demo_mapping` is the smoke test.
 
 ## Architecture
 
-The CUDA mapping is intentionally **PCL-free** so any front end can reuse it; PCL is
-only linked into the `pcd_write_test` starter.
+The CUDA mapping is intentionally **PCL-free** so any front end can reuse it; PCL enters
+only at the `universe` layer and above.
 
 - `point_pixel_mapping.cuh` — public API: `Camera` struct (row-major `K` 3×3, `T` 4×4
   camera-to-world **rigid** pose, image `W`/`H`) and `projectPointsToPixels(...)`, which
@@ -65,7 +77,7 @@ only linked into the `pcd_write_test` starter.
      `(u,v)` and depth, and atomically z-buffers the nearest depth.
   2. `visibilityKernel`: marks a point visible iff in-frame and
      `|zᵢ − D(u,v)| ≤ τ_vis`, filling the `[u,v,1]` correspondence map.
-- `demo_mapping.cpp` — synthetic two-quad occlusion scene exercising the full path.
+- `point_pixel_mapping_cpu.cpp` — the CPU back end (same API), built by default.
 
 ### Conventions that matter
 

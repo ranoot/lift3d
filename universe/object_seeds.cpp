@@ -9,6 +9,8 @@
 #include "hdbscan/point.h"
 #include "hdbscan/hdbscan.h"
 
+#include <pcl/filters/statistical_outlier_removal.h>   // SOR pre-filter before HDBSCAN
+
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -41,6 +43,45 @@ struct CoutSilencer {
 // surviving cluster needs >= min_cluster_size points anyway, so a sub-floor input can
 // never yield one. See the standalone sweep in the segfault investigation.
 constexpr int kHdbscanMinInput = 16;
+
+// Statistical Outlier Removal over `gidx` (universe global indices into `cloud`). For each
+// point computes the mean distance to its `mean_k` nearest neighbors and drops any point
+// whose mean exceeds mu + std_mul*sigma (global mean/stddev) -- pruning the sparse, low-
+// density points that HDBSCAN's MST would otherwise use to bridge distinct objects. Returns
+// the SURVIVING global indices (input order among survivors preserved); accumulates its wall
+// time into `acc_ms`. A no-op returning `gidx` unchanged when there are <= mean_k points
+// (SOR needs a full neighborhood to estimate density). Callers gate on sor_enabled.
+std::vector<int> sorFilterIndices(const Universe::Cloud& cloud, const std::vector<int>& gidx,
+                                  int mean_k, float std_mul, double& acc_ms) {
+    if (mean_k < 1) mean_k = 1;
+    if ((int)gidx.size() <= mean_k) return gidx;
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // Build a compact subcloud of just these points; SOR indices map 1:1 back to gidx.
+    pcl::PointCloud<Universe::PointT>::Ptr sub(new pcl::PointCloud<Universe::PointT>);
+    sub->reserve(gidx.size());
+    for (int g : gidx) {
+        if (g < 0 || g >= (int)cloud.size()) { sub->push_back(Universe::PointT()); continue; }
+        sub->push_back(cloud[g]);
+    }
+
+    std::vector<int> kept_idx;                          // indices into `sub` that survive
+    pcl::StatisticalOutlierRemoval<Universe::PointT> sor;
+    sor.setInputCloud(sub);
+    sor.setMeanK(mean_k);
+    sor.setStddevMulThresh((double)std_mul);
+    sor.filter(kept_idx);                               // default keeps inliers (dense points)
+
+    std::vector<int> out;
+    out.reserve(kept_idx.size());
+    for (int i : kept_idx)
+        if (i >= 0 && i < (int)gidx.size()) out.push_back(gidx[(std::size_t)i]);
+
+    const auto t1 = std::chrono::steady_clock::now();
+    acc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return out;
+}
 } // namespace
 
 // Run LOCAL-window HDBSCAN* per thing class over the still-UNCLAIMED, MATURED points.
@@ -111,7 +152,7 @@ void ObjectSeeds::seedLocal(const Universe& uni, const Params& p,
                                   std::get<2>(dendro[r]),        (long)std::get<3>(dendro[r])};
 
         std::vector<int> labels = extractFlatClusters(linkage, n, p.min_cluster_size,
-                                                       p.allow_single_cluster);
+                                                       p.allow_single_cluster, p.leaf_selection);
 
         // Collect points per flat cluster label (>=0); -1 == noise, dropped.
         int k = 0;
@@ -147,6 +188,7 @@ void ObjectSeeds::seedLocal(const Universe& uni, const Params& p,
 void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& gidx,
                                   const Params& p, InstanceIdGraph* idg) {
     ++version_;
+    last_sor_ms_ = 0.0;                                 // reset per-frame SOR timing accumulator
     // Ephemeral per-frame proposals: wipe last frame's clusters + claims so this frame
     // re-clusters the current visible set from scratch. Proposals do NOT persist or claim
     // across frames -- the same physical object is re-proposed every frame with overlapping
@@ -214,7 +256,12 @@ void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& g
     // Geometric HDBSCAN* over one class's member points: cluster xyz, extract flat clusters,
     // and append one seed per surviving cluster. The proven per-class path, shared by the
     // pure-geometry fallback loop and the instance-guided no-instance remainder.
-    auto clusterClass = [&](int cid, const std::vector<int>& mg) {
+    auto clusterClass = [&](int cid, const std::vector<int>& mg_in) {
+        // SOR pre-filter: drop sparse bridge points so HDBSCAN's MST can't fuse distinct
+        // objects. No-op (returns mg_in) when disabled or too few points.
+        const std::vector<int> mg = p.sor_enabled
+            ? sorFilterIndices(*cloud, mg_in, p.sor_mean_k, p.sor_std_mul, last_sor_ms_)
+            : mg_in;
         const int n = (int)mg.size();
         if (n < p.min_class_points || n <= min_pts || n < kHdbscanMinInput) return;
         parlay::sequence<pargeo::point<3>> P(n);
@@ -227,7 +274,7 @@ void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& g
         parlay::sequence<pargeo::dendroNode> dendro = pargeo::dendrogram(E, (size_t)n);
         std::vector<LinkNode> linkage = linkageOf(dendro);
         std::vector<int> labels = extractFlatClusters(linkage, n, p.min_cluster_size,
-                                                      p.allow_single_cluster);
+                                                      p.allow_single_cluster, p.leaf_selection);
         int k = 0;
         for (int l : labels) k = std::max(k, l + 1);
         if (k == 0) return;
@@ -278,9 +325,14 @@ void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& g
         std::map<int, int> cid_slot;
         int next_slot = 0;
         for (const auto& kv : by_class) {
-            if ((int)kv.second.size() < p.min_class_points) continue;
+            // Per-class SOR on real xyz BEFORE the class-gap 4th coord is added, so density
+            // is estimated within each class's geometry (no-op when disabled).
+            const std::vector<int> mg = p.sor_enabled
+                ? sorFilterIndices(*cloud, kv.second, p.sor_mean_k, p.sor_std_mul, last_sor_ms_)
+                : kv.second;
+            if ((int)mg.size() < p.min_class_points) continue;
             cid_slot[kv.first] = next_slot++;
-            for (int g : kv.second) { all_g.push_back(g); all_cid.push_back(kv.first); }
+            for (int g : mg) { all_g.push_back(g); all_cid.push_back(kv.first); }
         }
         const int n = (int)all_g.size();
         if (n <= min_pts || n < kHdbscanMinInput) return;
@@ -296,7 +348,7 @@ void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& g
         parlay::sequence<pargeo::dendroNode> dendro = pargeo::dendrogram(E, (size_t)n);
         std::vector<LinkNode> linkage = linkageOf(dendro);
         std::vector<int> labels = extractFlatClusters(linkage, n, p.min_cluster_size,
-                                                      p.allow_single_cluster);
+                                                      p.allow_single_cluster, p.leaf_selection);
         int k = 0;
         for (int l : labels) k = std::max(k, l + 1);
         if (k == 0) return;
@@ -321,13 +373,20 @@ double ObjectSeeds::hdbscanTimeOnly(const Universe& uni, const std::vector<int>&
     Universe::Cloud::ConstPtr cloud = uni.cloud();
     if (!cloud || cloud->empty()) return 0.0;
     const int min_pts = std::max(1, p.min_pts);
-    const int n = (int)gidx.size();
+
+    // Match the seeding path: SOR pre-filter (parity so the experiment measures the same
+    // input HDBSCAN actually clusters). `dummy_sor` discards the SOR sub-timing here.
+    double dummy_sor = 0.0;
+    std::vector<int> gidx_sor;
+    if (p.sor_enabled) gidx_sor = sorFilterIndices(*cloud, gidx, p.sor_mean_k, p.sor_std_mul, dummy_sor);
+    const std::vector<int>& gidx_f = p.sor_enabled ? gidx_sor : gidx;
+    const int n = (int)gidx_f.size();
     if (n <= min_pts || n < kHdbscanMinInput) return 0.0;   // too few points / hdbscan crash floor
 
     // Build the xyz point set (hdbscan<3> takes a mutable sequence of doubles).
     parlay::sequence<pargeo::point<3>> P(n);
     for (int j = 0; j < n; ++j) {
-        const int g = gidx[j];
+        const int g = gidx_f[j];
         if (g < 0 || g >= (int)cloud->size()) { double z[3] = {0,0,0}; P[j] = pargeo::point<3>(z); continue; }
         const Universe::PointT& pt = (*cloud)[g];
         double xyz[3] = {pt.x, pt.y, pt.z};
@@ -343,7 +402,7 @@ double ObjectSeeds::hdbscanTimeOnly(const Universe& uni, const std::vector<int>&
         linkage[r] = LinkNode{(long)std::get<0>(dendro[r]), (long)std::get<1>(dendro[r]),
                               std::get<2>(dendro[r]),        (long)std::get<3>(dendro[r])};
     std::vector<int> labels = extractFlatClusters(linkage, n, p.min_cluster_size,
-                                                  p.allow_single_cluster);
+                                                  p.allow_single_cluster, p.leaf_selection);
     const auto t1 = std::chrono::steady_clock::now();
 
     if (out_clusters) {

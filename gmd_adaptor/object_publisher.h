@@ -1,8 +1,8 @@
 #pragma once
 // -------------------------------------------------------------------------------------------------
-// Object egress: universe::Object -> Common::Entity::EAIRoomObject, published to a ROS2-style topic.
+// Object egress: universe::Object -> Common::Entity::EAIRoomObject.
 //
-// This is the sample egress side of the GMD adaptor (the mirror of gmd_stream_adaptor's ingress).
+// This is the sample egress side of the GMD adaptor (the mirror of gmd_frame_source's ingress).
 // It is deliberately PCL/CUDA/server-free: the pipeline caller pulls each object's alive member xyz
 // out of the Universe cloud and hands us plain (x,y,z) triples; everything here is pure C++ + the
 // GMD entity types, so it unit-tests without a GPU.
@@ -11,14 +11,14 @@
 // project member points onto the X-Y plane (drop Z), reject strays with a kNN statistical-outlier
 // pass so the hull isn't ballooned by grown boundary points, then take the convex hull.
 //
-// The "topic" models a ROS2/DDS latched keyed topic: publishing an object with the same objectId
-// overwrites the prior entry in a global store, and an update is reported through a sink callback
-// (the seam a real transport publisher plugs into later).
+// Each object carries a frame-stable objectId derived from the universe object id: the downstream
+// global store overwrites by objectId, so returning an object whose id already exists updates it,
+// and a new id creates it.
 // -------------------------------------------------------------------------------------------------
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>                              // MUST precede Object.h: that vendor header uses
@@ -27,8 +27,8 @@
 
 namespace gmd {
 
-using Point2Df    = Common::Entity::Point2D<float>;
-using EAINodeId   = Common::Entity::EAINodeId;
+using Point2Df      = Common::Entity::Point2D<float>;
+using EAINodeId     = Common::Entity::EAINodeId;
 using EAIRoomObject = Common::Entity::EAIRoomObject;
 
 // ------------------------------- pure 2D geometry (no PCL) ---------------------------------------
@@ -53,12 +53,18 @@ Point2Df centroid2D(const std::vector<Point2Df>& pts);
 // ------------------------------- EAIRoomObject construction --------------------------------------
 
 // Deterministic, frame-stable node id so the same universe object id always maps to the same
-// EAINodeId (required for upsert-by-id). ident encodes object_id as a raw tick count; vehicleId
-// should be non-zero so the id is never the NULL (0,0) node.
+// EAINodeId (so the downstream store upserts it). ident encodes object_id as a raw tick count;
+// vehicleId should be non-zero so the id is never the NULL (0,0) node.
 EAINodeId makeNodeId(uint16_t vehicleId, int object_id);
 
 // The NULL node id: {vehicleId = 0, ident = epoch}. Used for roomId (assigned later).
 EAINodeId nullNodeId();
+
+// Equality for EAINodeId (compares vehicleId and the ident tick count).
+inline bool nodeIdEqual(const EAINodeId& a, const EAINodeId& b) {
+    return a.vehicleId == b.vehicleId &&
+           a.ident.time_since_epoch().count() == b.ident.time_since_epoch().count();
+}
 
 // Build a published object from its 3D member points: project -> SOR -> convex hull, centroid from
 // the cleaned points. roomId is NULL and directionContent is "" (sign detection integrated later).
@@ -66,49 +72,23 @@ EAIRoomObject buildRoomObject(uint16_t vehicleId, int object_id, std::string lab
                               const std::vector<std::array<float, 3>>& member_xyz,
                               int sor_k = 8, float sor_alpha = 1.0f);
 
-// ------------------------------- ROS2-style keyed topic ------------------------------------------
+// ------------------------------- change tracking (return only the delta) -------------------------
 
-// Equality / hashing for EAINodeId so it can key the global store.
-inline bool nodeIdEqual(const EAINodeId& a, const EAINodeId& b) {
-    return a.vehicleId == b.vehicleId &&
-           a.ident.time_since_epoch().count() == b.ident.time_since_epoch().count();
-}
-struct EAINodeIdHash {
-    std::size_t operator()(const EAINodeId& n) const {
-        std::size_t h1 = std::hash<uint16_t>{}(n.vehicleId);
-        std::size_t h2 = std::hash<long long>{}(
-            static_cast<long long>(n.ident.time_since_epoch().count()));
-        return h1 ^ (h2 * 0x9E3779B97F4A7C15ULL);
-    }
-};
-struct EAINodeIdEq {
-    bool operator()(const EAINodeId& a, const EAINodeId& b) const { return nodeIdEqual(a, b); }
-};
-
-// A latched, keyed topic backed by an in-process global store. publish() upserts by objectId and
-// reports (fires the sink) only when the object is new or actually changed; an identical re-publish
-// is a silent no-op. A real ROS2/DDS publisher attaches via setOnUpdate().
-class ObjectTopic {
+// Remembers a fingerprint of each object it has emitted, keyed by objectId, so it can return only
+// the objects that are NEW (id never seen) or CHANGED (label / polygon / centroid differs) since
+// the last call. It stores one hash per id, NOT the objects themselves. Deletions are not tracked
+// (it never reports an object that vanished from the input).
+class ObjectDelta {
 public:
-    // (object, is_new): is_new == true on first insert, false when an existing entry changed.
-    using UpdateSink = std::function<void(const EAIRoomObject&, bool /*is_new*/)>;
-    using Store = std::unordered_map<EAINodeId, EAIRoomObject, EAINodeIdHash, EAINodeIdEq>;
+    // Returns the subset of `objects` that are new or changed, and records their fingerprints so a
+    // later identical object is suppressed. Unchanged objects are dropped.
+    std::vector<EAIRoomObject> changedSince(const std::vector<EAIRoomObject>& objects);
 
-    void setOnUpdate(UpdateSink sink) { on_update_ = std::move(sink); }
-
-    // Returns true if the store changed (new or updated), false if identical to the stored entry.
-    bool publish(const EAIRoomObject& obj);
-
-    const Store& store() const { return store_; }
-    std::size_t  size() const { return store_.size(); }
+    void clear() { seen_.clear(); }
+    std::size_t trackedCount() const { return seen_.size(); }
 
 private:
-    Store      store_;
-    UpdateSink on_update_;
+    std::unordered_map<std::uint64_t, std::size_t> seen_;  // objectId key -> fingerprint
 };
-
-// True when two published objects are semantically identical (used by ObjectTopic to suppress
-// no-op re-publishes). Compares label, directionContent, roomId, centroid, and polygon.
-bool sameRoomObject(const EAIRoomObject& a, const EAIRoomObject& b, float eps = 1e-4f);
 
 }  // namespace gmd

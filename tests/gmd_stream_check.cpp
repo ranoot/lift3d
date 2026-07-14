@@ -1,14 +1,13 @@
 // Integration check for the GMD -> pipeline translation layer, WITHOUT the heavy
 // semantic stack (no PCL, no inf_server, no GPU). It synthesizes a short trajectory of
 // GMD deployment messages (Common::Entity::PrimaryPose + PointCloud at 10 Hz, Image at
-// 5 Hz), feeds them through GmdStreamAdaptor into a real DogStream, and verifies the
+// 5 Hz), feeds them through GmdFrameSource's owned DogStream engine, and verifies the
 // translation end-to-end:
 //
 //   1. Every synthesized image is emitted exactly once, in increasing image_t order.
 //   2. The camera pose DogStream attaches equals the body pose INTERPOLATED to the image
 //      timestamp -- i.e. the GMD pose/cloud/image timestamps flowed through correctly and
-//      the sync still works (compared against a reference PoseInterpolator, as
-//      tests/dog_stream_check.cpp does).
+//      the sync still works (compared against a reference PoseInterpolator).
 //   3. A known body-frame lidar point lifts to the expected world coordinate (pose6 and
 //      the body->world lift round-trip).
 //   4. Pixel conversion is correct for RGB8 (copy), BGR8 (channel-swap) and MONO8
@@ -17,12 +16,12 @@
 // Build (PCL/OpenCV-free TUs + Eigen; no CMake needed):
 //   g++ -std=c++20 -I gmd_adaptor -I dog_log_adaptor -I point_pixel_mapping \
 //       -I gmdDataTypesForInterns2 -I /usr/include/eigen3 \
-//       tests/gmd_stream_check.cpp gmd_adaptor/gmd_stream_adaptor.cpp \
+//       tests/gmd_stream_check.cpp gmd_adaptor/gmd_frame_source.cpp \
 //       dog_log_adaptor/dog_log_adaptor.cpp dog_log_adaptor/pose_interp.cpp \
 //       dog_log_adaptor/dog_stream.cpp \
 //       gmdDataTypesForInterns2/GMDBase/Entity/TimeStamp.cpp -o /tmp/gsc && /tmp/gsc
 
-#include "gmd_stream_adaptor.h"
+#include "gmd_frame_source.h"
 
 #include "dog_log_adaptor.h"
 #include "dog_stream.h"
@@ -87,10 +86,10 @@ int main() {
     // --- capture emitted synced frames ------------------------------------------------
     struct Emit { int64_t image_t; float camx, camy, camz; std::vector<float> cloud; };
     std::vector<Emit> emits;
-    DogStream stream(calib, [&](const SyncedFrame& sf) {
+    gmd::GmdFrameSource src(calib);
+    src.setSyncedHook([&](const SyncedFrame& sf) {
         emits.push_back({sf.image_t, sf.cam.T[3], sf.cam.T[7], sf.cam.T[11], sf.cloud_world});
     });
-    gmd::GmdStreamAdaptor adaptor(stream);
 
     // --- synthesize a moving trajectory: poses+clouds @ 10 Hz, images @ 20 Hz ---------
     // A straight-line translation with a slow yaw sweep so interpolation is non-trivial.
@@ -123,7 +122,7 @@ int main() {
         PrimaryPose pp = poseAt(ts);
         double pose6[6]; gmd::toPose6(pp, pose6);
         ref.push(ts, pose6);
-        adaptor.pushScan(pp, makeCloud(ts, 1.0f, 0.0f, 0.0f)); // body point at +x
+        src.pushScan(pp, makeCloud(ts, 1.0f, 0.0f, 0.0f)); // body point at +x
 
         // Emit an image mid-interval (except after the last scan -> unbracketable).
         if (k < nscan - 1) {
@@ -142,11 +141,11 @@ int main() {
                 im.data[0] = 42;
             }
             imgs.push_back(im);
-            adaptor.pushImage(im);
+            src.pushImage(im);
             ++img_seq;
         }
     }
-    adaptor.flush();
+    src.flush();
 
     // --- checks -----------------------------------------------------------------------
     int fails = 0;
@@ -231,7 +230,7 @@ int main() {
     if (gmd::toDogImage(bad, tmp)) { std::printf("[FAIL] NOT_APPLICABLE image not rejected\n"); ++fails; }
 
     std::printf("\nsynced frames: %zu (of %d images pushed; %ld dropped too_old, %ld overflow)\n",
-                emits.size(), img_seq, stream.droppedTooOld(), stream.droppedOverflow());
+                emits.size(), img_seq, src.droppedTooOld(), src.droppedOverflow());
     std::printf("image_t strictly increasing:      %s\n", monotonic ? "yes" : "NO");
     std::printf("camera == interpolated(image_t):  max err %.2e m\n", max_pose_err);
     std::printf("body->world lift:                 max err %.2e m\n", max_lift_err);

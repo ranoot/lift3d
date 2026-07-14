@@ -51,13 +51,6 @@ include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
-# pcd_write_test.cpp no longer present in the tree; re-add if you restore it.
-# add_executable(pcd_write_test pcd_write_test.cpp)
-# target_link_libraries(pcd_write_test ${PCL_LIBRARIES})
-
-# find_package(cppzmq)
-# target_link_libraries(lift3d cppzmq)
-
 # SGS-3D point-to-pixel mapping: same API, CPU or CUDA back end.
 if(LIFT3D_USE_CUDA)
   add_library(point_pixel_mapping STATIC point_pixel_mapping/point_pixel_mapping.cu)
@@ -74,10 +67,6 @@ else()
 endif()
 target_include_directories(point_pixel_mapping PUBLIC point_pixel_mapping)
 
-# demo_mapping.cpp no longer present in the tree; re-add if you restore it.
-# add_executable(demo_mapping demo_mapping.cpp)
-# target_link_libraries(demo_mapping point_pixel_mapping)
-
 # Adaptor for ~/dog_logs (Raibo EAI logs): file decode + the transport-agnostic
 # online sync layer (PoseInterpolator + DogStream) + the offline simulated ingestor.
 add_library(dog_log_adaptor STATIC
@@ -88,36 +77,6 @@ add_library(dog_log_adaptor STATIC
 target_include_directories(dog_log_adaptor PUBLIC dog_log_adaptor)
 target_link_libraries(dog_log_adaptor PRIVATE Eigen3::Eigen)
 set_target_properties(dog_log_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# run_dog_mapping.cpp no longer present in the tree; re-add if you restore it.
-# add_executable(run_dog_mapping run_dog_mapping.cpp)
-# target_link_libraries(run_dog_mapping dog_log_adaptor point_pixel_mapping)
-
-# Superpoint segmentation via L0 cut-pursuit (superpoint_graph submodule).
-# cut-pursuit is header-only; its core uses std::binary_function, which is
-# deprecated but still provided by libstdc++ through C++20, so it builds at the
-# project standard. API.h is included only by spg_segment.cpp, so Boost stays
-# private and does not leak through spg_segment.h.
-set(CUTPURSUIT_INCLUDE_DIR
-    ${CMAKE_CURRENT_SOURCE_DIR}/superpoint_graph/partition/cut-pursuit/include)
-find_package(OpenMP REQUIRED)
-
-# Guarded: the spg_segment sources are a work-in-progress and may not exist yet.
-# Without this, a reconfigure fails outright ("Cannot find source file") and blocks
-# every other target. Drop the guard once spg_segment/spg_segment.cpp lands.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/spg_segment/spg_segment.cpp)
-  add_library(spg_segment STATIC spg_segment/spg_segment.cpp)
-  target_include_directories(spg_segment
-    PUBLIC spg_segment
-    PRIVATE ${CUTPURSUIT_INCLUDE_DIR})
-  target_link_libraries(spg_segment
-    PUBLIC ${PCL_LIBRARIES}
-    PRIVATE OpenMP::OpenMP_CXX)
-  set_target_properties(spg_segment PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-  add_executable(spg_segment_cli spg_segment/spg_segment_cli.cpp)
-  target_link_libraries(spg_segment_cli spg_segment ${PCL_LIBRARIES})
-endif()
 
 # inf_server IPC client: cppzmq (vendored) + a hand-rolled msgpack subset. Uses the
 # vendored zmq.h headers against the system libzmq runtime (no -dev package needed).
@@ -187,15 +146,6 @@ target_link_libraries(run_config
   PRIVATE yaml-cpp)
 set_target_properties(run_config PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_executable(run_universe universe/run_universe.cpp)
-target_include_directories(run_universe PRIVATE dog_log_adaptor)
-target_link_libraries(run_universe universe dog_log_adaptor ${PCL_LIBRARIES})
-
-# Rerun visualizer: replays a dog log, builds up the map, logs to a .rrd.
-add_executable(viz_universe universe/viz_universe.cpp)
-target_include_directories(viz_universe PRIVATE dog_log_adaptor)
-target_link_libraries(viz_universe universe dog_log_adaptor ${PCL_LIBRARIES} rerun_sdk)
-
 # Semantic Universe: accumulate + lift inf_server 2D labels onto every world point.
 add_executable(run_semantic_universe universe/run_semantic_universe.cpp)
 target_link_libraries(run_semantic_universe
@@ -227,7 +177,7 @@ target_link_libraries(gmd_types PUBLIC Eigen3::Eigen)
 set_target_properties(gmd_types PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(gmd_adaptor STATIC
-  gmd_adaptor/gmd_stream_adaptor.cpp
+  gmd_adaptor/gmd_frame_source.cpp
   gmd_adaptor/object_publisher.cpp)
 target_include_directories(gmd_adaptor PUBLIC gmd_adaptor gmdDataTypesForInterns2)
 target_link_libraries(gmd_adaptor PUBLIC gmd_types dog_log_adaptor Eigen3::Eigen)

@@ -39,8 +39,7 @@
 #include "objects.h"
 #include "run_config.h"
 #include "dog_log_adaptor.h"
-#include "dog_stream.h"
-#include "dog_log_ingestor.h"
+#include "log_frame_source.h"   // LogFrameSource (offline replay; owns the DogStream engine)
 #include "inf_client.h"
 #include "semantic_pipeline.h"
 #include "online_semantic.h"
@@ -137,15 +136,16 @@ int main(int argc, char** argv) {
         reader.openCamera(log + "/camera" + std::to_string(cam_id) + ".gclf");
         if (reader.size() == 0) { std::fprintf(stderr, "empty recording\n"); return 1; }
 
-        InfClient inf(p.endpoint);
-        if (!inf.ping()) { std::fprintf(stderr, "inf_server not responding at %s\n",
-                                        p.endpoint.c_str()); return 1; }
-
-        Universe uni(p.voxel);
-        uni.setLocalRadius(p.radius);
-        Superpoints sp;
-        ObjectSeeds os;
-        Objects obj;
+        // OnlineSemantic OWNS the pipeline; the visualizer is a pure consumer. Bind live
+        // references to the owned stages so the per-frame hook + final static snapshot below
+        // (which capture uni/sp/os/obj by reference) read the pipeline's own instances.
+        semantic::OnlineSemantic online(p);
+        if (!online.inf().ping()) { std::fprintf(stderr, "inf_server not responding at %s\n",
+                                                 p.endpoint.c_str()); return 1; }
+        Universe&    uni = online.universe();
+        Superpoints& sp  = online.superpoints();
+        ObjectSeeds& os  = online.seeds();
+        Objects&     obj = online.objects();
 
         rerun::RecordingStream rec("lift3d/semantic_universe");
         if (spawn) rec.spawn().exit_on_failure();
@@ -389,15 +389,12 @@ int main(int argc, char** argv) {
             };
 
         // Drive the SAME pipeline the headless runner uses; the visualizer is a pure
-        // consumer (frame hook above). The offline ingestor feeds pushScan/pushImage.
-        semantic::OnlineSemantic online(uni, inf, p, &sp,
-                                        p.hdbscan ? &os : nullptr,
-                                        p.objects ? &obj : nullptr);
+        // consumer (frame hook above). The offline LogFrameSource feeds pushScan/pushImage.
         online.setFrameHook(hook);
-        DogStream stream(cam, online.hook());
+        LogFrameSource src(reader, cam);
+        online.attach(src);
         online.begin();
-        DogLogIngestor ingestor(reader);
-        ingestor.run(stream, p.start, p.count > 0 ? p.count : -1, p.stride);
+        src.run(p.start, p.count > 0 ? p.count : -1, p.stride);
         online.finish();
         int frames = online.frames();
 

@@ -1,0 +1,6 @@
+# The downloaded/built wheel bundles are large (torch + nvidia-* run to several GB
+# per target). Track the scripts + resolved requirement lists, not the wheels.
+wheelhouse-linux-x86_64/
+wheelhouse-linux-aarch64/
+wheelhouse-windows-amd64/
+wheelhouse-noarch/

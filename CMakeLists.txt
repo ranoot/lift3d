@@ -9,6 +9,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # -DLIFT3D_USE_CUDA=ON when a usable CUDA device/driver is available.
 option(LIFT3D_USE_CUDA "Build the CUDA back end instead of the CPU one" OFF)
 
+# Async sign-text egress: compile the teammate's SignUnderstanding module (sign-unds/) +
+# our sign_adaptor bridge into run_semantic_universe. OFF by default so the normal build
+# needs no OpenCV/CURL/VLM deps. Use a separate build dir (e.g. build-sign) when ON.
+option(LIFT3D_USE_SIGN "Build the async sign-text egress (SignUnderstanding + bridge)" OFF)
+
 if(LIFT3D_USE_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
@@ -190,3 +195,48 @@ target_link_libraries(gmd_stream_check gmd_adaptor gmd_types dog_log_adaptor Eig
 # Object egress check: EAIRoomObject 2D-hull publisher + keyed topic (no PCL / GPU / servers).
 add_executable(object_publisher_check tests/object_publisher_check.cpp)
 target_link_libraries(object_publisher_check gmd_adaptor gmd_types)
+
+# ---------------------------------------------------------------------------------------
+# Sign-text egress (LIFT3D_USE_SIGN). Additive + optional: compiles the teammate's
+# SignUnderstanding detector chain (sign-unds/) plus our sign_adaptor bridge, and folds
+# resolved sign text into run_semantic_universe's EAIRoomObject::directionContent. Nothing
+# above is touched when the option is OFF.
+# ---------------------------------------------------------------------------------------
+if(LIFT3D_USE_SIGN)
+  find_package(CURL REQUIRED)
+  find_package(OpenCV REQUIRED)
+  find_package(JPEG REQUIRED)   # VlmClient uses libjpeg directly
+  find_package(PNG REQUIRED)    # VlmClient uses libpng directly
+
+  # nlohmann/json: prefer a system package, else fetch it (mirrors sign-unds/CMakeLists.txt).
+  find_package(nlohmann_json QUIET)
+  if(NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann/json not found; fetching v3.11.3")
+    FetchContent_Declare(nlohmann_json
+      GIT_REPOSITORY https://github.com/nlohmann/json.git GIT_TAG v3.11.3)
+    FetchContent_MakeAvailable(nlohmann_json)
+  endif()
+
+  set(SIGN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/sign-unds)
+  # NOTE: GmdTimeStubs.cpp is intentionally excluded -- its Common::Time symbols are already
+  # defined by gmd_types (real TimeStamp.cpp), so compiling it here would duplicate them.
+  add_library(sign_adaptor STATIC
+    sign_adaptor/sign_bridge.cpp
+    ${SIGN_SRC}/src/ConcurrentDetectorWrapper.cpp
+    ${SIGN_SRC}/src/DetectorWrapper.cpp
+    ${SIGN_SRC}/src/VlmClient.cpp
+    ${SIGN_SRC}/src/CroppingEngine.cpp
+    ${SIGN_SRC}/src/ResponseProcessor.cpp)
+  target_include_directories(sign_adaptor PUBLIC
+    sign_adaptor ${SIGN_SRC}/include gmdDataTypesForInterns2)
+  target_link_libraries(sign_adaptor
+    PUBLIC  universe dog_log_adaptor gmd_types
+    PRIVATE CURL::libcurl ${OpenCV_LIBS} nlohmann_json::nlohmann_json
+            ${JPEG_LIBRARIES} ${PNG_LIBRARIES} Eigen3::Eigen Threads::Threads)
+  set_target_properties(sign_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+  # Turn on the #ifdef'd bridge wiring in the runner and link the egress in.
+  target_compile_definitions(run_semantic_universe PRIVATE LIFT3D_HAVE_SIGN)
+  target_link_libraries(run_semantic_universe sign_adaptor)
+  message(STATUS "LIFT3D_USE_SIGN: sign-text egress enabled")
+endif()

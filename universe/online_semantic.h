@@ -50,6 +50,9 @@ public:
 
     void setFrameHook(FrameHook h)     { on_frame_   = std::move(h); }
     void setObjectsHook(ObjectsHook h) { on_objects_ = std::move(h); }
+    // Optional sign-egress hook (see semantic_pipeline.h): when set, each frame's 2D masks
+    // + a pixel->3D lookup are handed out for async sign-text detection. Dormant otherwise.
+    void setSignHook(SignFrameHook h)  { on_sign_    = std::move(h); }
 
     // Route a FrameSource's time-synced frames into this pipeline. Call once before the
     // source's first push (it builds the source's sync engine). The source is borrowed --
@@ -105,8 +108,16 @@ public:
         PointPixelMap    m;
         StepTiming       st;
         std::vector<int> gidx;
+        // Sign egress: only ask stepFrameSynced for the 2D masks + pixel->3D map when a
+        // consumer is attached (the copies are skipped otherwise).
+        FrameResult      sign_fr;
+        std::vector<int> sign_pix_gidx;
+        const bool       do_sign = static_cast<bool>(on_sign_);
         // Integrate + infer + project + stamp per-frame labels.
-        stepFrameSynced(uni_, inf_, p_, sf, m, gidx, &st, use_ids ? &idg_ : nullptr);
+        stepFrameSynced(uni_, inf_, p_, sf, m, gidx, &st, use_ids ? &idg_ : nullptr,
+                        do_sign ? &sign_fr : nullptr, do_sign ? &sign_pix_gidx : nullptr);
+        if (do_sign && sign_fr.ok())
+            on_sign_(sf, sign_fr, sign_pix_gidx, sign_fr.w, sign_fr.h, uni_);
         prof_.add("read+integrate", st.read_integrate);
         prof_.add("infer",          st.infer);
         prof_.add("project",        st.project);
@@ -237,8 +248,9 @@ private:
     // Fed in stepFrameSynced, consulted in seedFromIndices; reset each begin().
     InstanceIdGraph idg_;
 
-    FrameHook   on_frame_;
-    ObjectsHook on_objects_;
+    FrameHook     on_frame_;
+    ObjectsHook   on_objects_;
+    SignFrameHook on_sign_;
 
     int       done_ = 0;
     Profile   prof_;

@@ -3,23 +3,29 @@ name = "inf-server"
 version = "0.1.0"
 description = "IPC inference server around the OV-DVIS++ online model"
 readme = "README.md"
-# Pinned to Python 3.10 + CUDA 11.8 torch so detectron2 + the MSDeformAttn CUDA
+# Pinned to Python 3.11 + CUDA 12.6 torch so detectron2 + the MSDeformAttn CUDA
 # kernel build against a single, known stack. Like mask3d_feat, this venv only
 # talks to the rest of the system over zmq/msgpack, so the pinned stack here is
 # isolated from the C++/CUDA side of the repo.
 #
-# detectron2 is NOT listed here: it builds CUDA ops from source and must compile
-# against the venv's torch with the cu118 toolchain, so it is installed in a
+# detectron2 is a CUDA source build (see the `cuda-ext` group below): it is NOT
+# synced by default because it must compile against the already-installed venv
+# torch with the cu126 toolchain (chicken-and-egg on a fresh sync). It is pinned
+# in the `cuda-ext` group so uv records it in the lock/export, and installed in a
 # second step (see build_cuda_ext.sh / README) with --no-build-isolation.
-requires-python = "==3.10.*"
+#
+# torchvision is pinned bare (no +cu126 local tag) on purpose: pytorch's cu126
+# index publishes the aarch64 torchvision wheel WITHOUT the +cu126 local version
+# (x86_64 gets 0.21.0+cu126), and a bare `==0.21.0` matches both per PEP 440.
+requires-python = "==3.11.*"
 dependencies = [
     # IPC
-    "pyzmq>=25",
+    "pyzmq==26.4.0",
     "msgpack>=1.0",
-    "numpy<2",
+    "numpy>=2.1.0,<2.2.6",
     # model stack
-    "torch==2.0.1",
-    "torchvision==0.15.2",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
     # build/runtime: torch 2.0.1 + detectron2 import pkg_resources, dropped in
     # setuptools 81+, so keep an older setuptools in the venv.
     "setuptools<80",
@@ -32,16 +38,32 @@ dependencies = [
     "shapely",
     "opencv-python-headless",
     "scikit-image",
-    "h5py",
+    "h5py==3.14.0",
     "pycocotools",
     "cython",
 ]
 
+# The two CUDA source builds inf_server needs. NOT installed on a plain `uv sync`
+# (they must compile against the venv's torch + a CUDA 12.6 toolchain), but pinned
+# here so uv records them in uv.lock and `uv export --only-group cuda-ext` can emit
+# them into the offline bundle. Install them explicitly in the second build step.
+#   - detectron2: pinned git commit, built --no-build-isolation.
+#   - MSDeformAttn is NOT a package (vendored source under DVIS_Plus); it is built
+#     into a wheel by export/build_on_target_aarch64.sh, not tracked here.
+[dependency-groups]
+cuda-ext = [
+    "detectron2",
+]
+
+[tool.uv]
+no-build-isolation-package = ["detectron2"]
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu118" }
-torchvision = { index = "pytorch-cu118" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+detectron2 = { git = "https://github.com/facebookresearch/detectron2.git", rev = "02b5c4e295e990042a714712c21dc79b731e8833" }
 
 [[tool.uv.index]]
-name = "pytorch-cu118"
-url = "https://download.pytorch.org/whl/cu118"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true

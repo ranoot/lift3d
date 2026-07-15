@@ -21,6 +21,9 @@
 #include "semantic_pipeline.h"
 #include "online_semantic.h"
 #include "object_publisher.h"   // gmd:: EAIRoomObject egress (2D overhead hull + keyed topic)
+#ifdef LIFT3D_HAVE_SIGN
+#include "sign_bridge.h"        // sign:: async sign-text egress (LIFT3D_USE_SIGN builds only)
+#endif
 
 #include <pcl/io/pcd_io.h>
 
@@ -29,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 static std::string arg_str(int argc, char** argv, const char* key, const std::string& def) {
@@ -114,8 +118,12 @@ int main(int argc, char** argv) {
         // NOTE: Object::id is a Union-Find root that can change when components merge, so id
         // stability is bounded by that root; a persistent id would come from the instance-id layer.
         const auto vehicle_id = static_cast<uint16_t>(cfg.cam);
+        // `dir` (optional): object id -> directionContent from resolved sign text. When present,
+        // an object that encompasses a sign carries its text; others stay "". Null in a non-sign
+        // build, so directionContent is unchanged there.
         auto collectEAIObjects = [](const std::vector<Object>& objs, const Universe& u,
-                                    uint16_t vehicleId) {
+                                    uint16_t vehicleId,
+                                    const std::unordered_map<int, std::string>* dir) {
             std::vector<gmd::EAIRoomObject> updates;
             Universe::Cloud::ConstPtr cloud = u.cloud();
             std::vector<std::array<float, 3>> xyz;
@@ -131,20 +139,42 @@ int main(int argc, char** argv) {
                 if (xyz.empty()) continue;
                 updates.push_back(gmd::buildRoomObject(vehicleId, o.id,
                                                        u.semantics().name(o.class_id), xyz));
+                if (dir) {
+                    auto it = dir->find(o.id);
+                    if (it != dir->end()) updates.back().directionContent = it->second;
+                }
             }
             return updates;
         };
+
+        // Sign-text egress (LIFT3D_USE_SIGN builds only): dispatch detected signs to the async
+        // detector and, at publish time, fold resolved text into directionContent. Off => `dir`
+        // stays null below and nothing sign-related is compiled.
+#ifdef LIFT3D_HAVE_SIGN
+        sign::SignBridge sign_bridge{sign::SignBridge::Config{}};
+        online.setSignHook([&sign_bridge, &online, &p](
+                const SyncedFrame& sf, const FrameResult& fr,
+                const std::vector<int>& pix_gidx, int W, int H, const Universe& u) {
+            sign_bridge.onFrame(sf, fr, pix_gidx, W, H, u, online.inf(), p.voxel);
+        });
+#endif
+
         gmd::ObjectDelta delta;  // remembers what was already emitted so we only send the changes
         online.setObjectsHook([&, vehicle_id](const std::vector<Object>& objs, const Universe& u) {
-            std::vector<gmd::EAIRoomObject> all = collectEAIObjects(objs, u, vehicle_id);
+            const std::unordered_map<int, std::string>* dir = nullptr;
+#ifdef LIFT3D_HAVE_SIGN
+            std::unordered_map<int, std::string> sign_dir = sign_bridge.annotate(objs, u, p.voxel);
+            dir = &sign_dir;
+#endif
+            std::vector<gmd::EAIRoomObject> all = collectEAIObjects(objs, u, vehicle_id, dir);
             std::vector<gmd::EAIRoomObject> updates = delta.changedSince(all);  // new or changed only
             // Hand `updates` to the global object store (same objectId overwrites).
             for (const gmd::EAIRoomObject& o : updates)
                 std::fprintf(stderr,
                              "[objects] upsert id=(veh %u) label=%s hull=%zu verts "
-                             "centroid=(%.2f,%.2f)\n",
+                             "centroid=(%.2f,%.2f) dir=\"%s\"\n",
                              o.objectId.vehicleId, o.label.c_str(), o.polygon.size(),
-                             o.centroid.x, o.centroid.y);
+                             o.centroid.x, o.centroid.y, o.directionContent.c_str());
         });
 
         LogFrameSource src(reader, cam);

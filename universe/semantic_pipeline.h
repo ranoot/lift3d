@@ -185,6 +185,17 @@ using FrameHook = std::function<void(int, const SyncedFrame&, const PointPixelMa
 // they index into. Fired when the objects tier is (re)computed.
 using ObjectsHook = std::function<void(const std::vector<Object>&, const Universe&)>;
 
+// Sign hook (optional egress side-channel for sign-text detection): fired per synced
+// frame with this frame's 2D masks (`fr`), a pixel -> nearest-surface global universe
+// index lookup (`pix_gidx`, size W*H, -1 where nothing is in front), the image dims, and
+// the Universe. A consumer scans `fr` for sign instances, turns their pixels into 3D
+// footprints via pix_gidx, and dispatches them to the async sign detector. Only fired
+// when set (setSignHook), so the core pipeline pays nothing unless a sign build attaches
+// it. Deliberately sign-agnostic: it carries only core types.
+using SignFrameHook = std::function<void(const SyncedFrame&, const FrameResult&,
+                                         const std::vector<int>& pix_gidx,
+                                         int W, int H, const Universe&)>;
+
 // One synced frame's core work: integrate geometry, infer 2D labels, project, and STAMP
 // each visible point with the current frame's class + DVIS instance id (no cross-view
 // voting -- labels are per-frame transient). `out_gidx` receives the NEAREST-PER-PIXEL
@@ -192,10 +203,16 @@ using ObjectsHook = std::function<void(const std::vector<Object>&, const Univers
 // surface, bounded by image resolution), which is the pipeline's per-view working set
 // before the thing filter. The camera pose in sf.cam is already interpolated to sf.image_t,
 // so labels are lifted at the image instant. Returns the new view id. Source-agnostic.
+// `out_fr` (optional): receives a copy of this frame's 2D FrameResult (masks + class
+// ids) for a sign/egress consumer. `out_pix_gidx` (optional): receives a W*H pixel ->
+// nearest-visible-surface global index map (-1 where nothing is in front), built in the
+// front-shell pass at no extra cost. Both nullptr by default -> zero overhead.
 inline int stepFrameSynced(Universe& uni, InfClient& inf,
                            const Params& p, const SyncedFrame& sf, PointPixelMap& out_map,
                            std::vector<int>& out_gidx, StepTiming* st = nullptr,
-                           InstanceIdGraph* idg = nullptr) {
+                           InstanceIdGraph* idg = nullptr,
+                           FrameResult* out_fr = nullptr,
+                           std::vector<int>* out_pix_gidx = nullptr) {
     Stopwatch sw;
     Universe::Cloud::Ptr cloud = syncedToCloud(sf);
     const double t_build = sw.lap();               // folded into read_integrate below
@@ -242,6 +259,9 @@ inline int stepFrameSynced(Universe& uni, InfClient& inf,
     const float band = p.surf_band > 0.0f ? p.surf_band : 0.0f;
     std::vector<float> best_d((std::size_t)W * H, 0.0f);
     std::vector<char>  seen((std::size_t)W * H, 0);
+    // Optional per-pixel nearest-surface global index for an egress consumer (sign
+    // footprints). Filled alongside best_d below; -1 = no visible surface at that pixel.
+    if (out_pix_gidx) out_pix_gidx->assign((std::size_t)W * H, -1);
     for (int k = 0; k < out_map.N; ++k) {
         if (!out_map.isVisible(k)) continue;
         const int u = out_map.u(k), v = out_map.v(k);
@@ -250,8 +270,12 @@ inline int stepFrameSynced(Universe& uni, InfClient& inf,
         if (!uni.pointAlive(idx)) continue;            // tombstoned -> skip
         const std::size_t pix = (std::size_t)v * W + u;
         const float d = out_map.depth[k];
-        if (!seen[pix] || d < best_d[pix]) { best_d[pix] = d; seen[pix] = 1; }
+        if (!seen[pix] || d < best_d[pix]) {
+            best_d[pix] = d; seen[pix] = 1;
+            if (out_pix_gidx) (*out_pix_gidx)[pix] = idx;   // nearest surface at this pixel
+        }
     }
+    if (out_fr) *out_fr = fr;                           // hand the 2D masks to the consumer
 
     // Stamp per-frame labels (replaces the old vote loop): reset every point to unlabeled,
     // then paint the front-shell points from THIS frame's maps -- transient by design

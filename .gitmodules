@@ -7,3 +7,6 @@
 [submodule "mask3d_feat/MinkowskiEngine"]
 	path = mask3d_feat/MinkowskiEngine
 	url = https://github.com/NVIDIA/MinkowskiEngine.git
+[submodule "sign-unds"]
+	path = sign-unds
+	url = https://gitlab.ai-stack.dso/cyonglia/sign-unds.git

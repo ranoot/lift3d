@@ -212,16 +212,33 @@ consolidate. Then fire consumer hooks.
      sees them on a person segment kills them. The z-buffer already gated visibility, so only
      points actually ON the person die; occluded geometry behind stays.
 
-**Vote store:** per-point sparse histogram of `(class_id, count)`. Class ids come from a
-stable `SemanticVocabulary` keyed on class **name**, so a runtime `set_vocab` change merely
-interns new names — ids already assigned never shift, earlier votes stay valid. (inf_server's
-per-call integer labels are only meaningful relative to that call's sorted vocab; keying on
-name decouples the stored semantics from any single call.)
+**Backprojected class — two modes (`voting.enabled`):**
 
-**Label gate (read-time):** a point resolves to a class only if it has ≥ `min_votes` total
-votes AND the winning class holds ≥ `min_conf` of them. Below the gate → unlabeled. This
-filters sparse/ambiguous points (e.g. specular-reflection points that leaked a handful of
-frustum votes) without touching the stored histograms. Defaults `(1, 0)` = plain argmax.
+- *Naive (default):* a point's class is whatever the **current** frame's 2D segmentation
+  projects onto it — `setFrameLabel` overwrites a transient per-point label each frame, no
+  accumulation. Downstream stages read only the current view's points, so they see a fresh
+  current-frame label.
+- *Voting (`voting.enabled: true`):* every observation instead **votes** into a persistent
+  per-point sparse histogram of `(class_id, count)`, and the point's class is the argmax —
+  a cross-frame consensus rather than the last frame's guess. The histogram survives across
+  frames (reset only when its voxel is tombstoned/revived).
+
+Class ids come from a stable `SemanticVocabulary` keyed on class **name**, so a runtime
+`set_vocab` change merely interns new names — ids already assigned never shift, earlier votes
+stay valid. (inf_server's per-call integer labels are only meaningful relative to that call's
+sorted vocab; keying on name decouples the stored semantics from any single call.)
+
+**Stuff bias (voting mode):** the argmax weights each class's votes by `stuff_bias` (≥ 1) when
+it is a *stuff* class, so a thing overtakes the leading stuff class only once its votes exceed
+stuff's by that factor — "a point seen as stuff is harder to turn into a thing." This is the
+principled curb for the occlusion/label-leak that paints objects onto walls/floor (sparse
+z-buffer holes let a wall point grab a stray `chair` pixel; one biased vote can't flip it).
+Because the `active` working set that feeds superpoints/HDBSCAN is exactly `pointIsThing`, the
+bias directly suppresses spurious thing seeds on stuff surfaces.
+
+**Label gate (read-time, voting mode):** a point resolves to a class only if it has ≥
+`min_votes` total votes AND the winning class holds ≥ `min_conf` of the raw votes. Below the
+gate → unlabeled. Defaults `(1, 0)` = plain (stuff-biased) argmax.
 
 ### 7.2 Mask3D per-point features (cadence)
 
@@ -348,7 +365,8 @@ default. CLI flags `--log`, `--out`, `--spawn` override the file.
 | recording | `log`, `calib` (empty ⇒ `<log>/../CameraCalRaiboAsQUGV113.xml`), `cam`, `out` | inputs + output path |
 | window | `start`, `count`, `stride` | frame range; `stride` sub-samples the image window |
 | map/projection | `voxel` (fusion size), `radius` (label crop; 0 = whole map), `proj_radius` (tighter z-buffer candidate crop), `tau` (z-buffer tolerance m), `splat` (depth dilation px) | §4, §6 |
-| label gate | `min_votes`, `min_conf`, `things_only` | §7.1 |
+| voting | `enabled`, `stuff_bias`, `min_votes`, `min_conf` | §7.1 (cross-frame class; off => naive per-frame) |
+| label filter | `things_only` | §7.1 |
 | inference | `endpoint`, `thing[]`, `stuff[]`, `dynamic[]` | vocab + dynamic-reject classes |
 | cadence | `refine_every` | §7.7 |
 | superpoints | `enabled`, `seed`, `radius`, `thing_frac`, `spatial`, `normal`, `refine` | §7.3 |

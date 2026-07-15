@@ -128,6 +128,19 @@ struct Params {
     // grow with map density -- it is bounded by the visible surface either way.
     float surf_band = 0.0f;
     bool  things_only = false; // if set, only "thing" classes are stamped (stuff skipped)
+
+    // Persistent cross-frame voting for the per-point class (Universe::setVoting). Off =>
+    // naive per-frame labels (a point's class is the last frame's 2D guess). On => each
+    // observation votes into a persistent histogram and the class is its stuff-biased
+    // argmax, so the backprojection is a multi-view consensus. `vote_stuff_bias` (>= 1)
+    // up-weights stuff votes so a point seen as stuff resists flipping to a thing (curbs
+    // objects leaking onto walls); `vote_min_votes`/`vote_min_conf` are the optional
+    // label gate (1, 0 => plain argmax).
+    bool  voting = false;
+    float vote_stuff_bias = 2.0f;
+    int   vote_min_votes = 1;
+    float vote_min_conf = 0.0f;
+
     std::vector<std::string> thing;
     std::vector<std::string> stuff;
     // Class names whose GEOMETRY is rejected from the map at ingest (dynamic objects,

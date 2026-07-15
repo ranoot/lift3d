@@ -56,6 +56,7 @@ void Universe::clear() {
     views_.clear();
     flabel_.clear();
     fiid_.clear();
+    votes_.clear();
     color_.clear();
     color_n_.clear();
     sem_ = SemanticVocabulary{};
@@ -118,6 +119,7 @@ int Universe::integrate(const Cloud& cloud_world, const Camera& view,
             alive_.push_back(1);            // born live; parallel to map_
             flabel_.push_back(-1);          // per-frame label, stamped after projection
             fiid_.push_back(-1);            // per-frame DVIS instance id
+            votes_.emplace_back();          // persistent vote histogram (voting mode)
             color_.push_back({0.0f, 0.0f, 0.0f});   // colour fused later from images
             color_n_.push_back(0);
             vox_.emplace(k, idx);
@@ -134,6 +136,7 @@ int Universe::integrate(const Cloud& cloud_world, const Camera& view,
                 count_[idx] = 1;
                 flabel_[idx] = -1;
                 fiid_[idx] = -1;
+                votes_[idx].clear();        // discard the vacated point's vote history
                 color_[idx] = {0.0f, 0.0f, 0.0f};
                 color_n_[idx] = 0;
                 alive_[idx] = 1;
@@ -242,13 +245,32 @@ void Universe::clearFrameLabels() {
     fiid_.assign(n, -1);
 }
 
+void Universe::setVoting(bool on, float stuff_bias, int min_votes, float min_conf) {
+    voting_     = on;
+    stuff_bias_ = stuff_bias >= 1.0f ? stuff_bias : 1.0f;  // < 1 would DIS-favour stuff
+    min_votes_  = min_votes > 1 ? min_votes : 1;
+    min_conf_   = min_conf < 0.0f ? 0.0f : (min_conf > 1.0f ? 1.0f : min_conf);
+}
+
+void Universe::castVote(int idx, int cid) {
+    auto& hist = votes_[idx];
+    for (auto& pc : hist) {
+        if (pc.first == (std::uint16_t)cid) {
+            if (pc.second < 0xffff) ++pc.second;           // saturate, don't wrap
+            return;
+        }
+    }
+    hist.emplace_back((std::uint16_t)cid, (std::uint16_t)1);
+}
+
 void Universe::setFrameLabel(int global_idx, const std::string& class_name,
                              int instance_id) {
     if (global_idx < 0 || global_idx >= (int)flabel_.size()) return;
     const int cid = sem_.intern(class_name);
     if (cid < 0) return;                                   // empty/background -> unlabeled
-    flabel_[global_idx] = cid;
-    fiid_[global_idx]   = instance_id;
+    fiid_[global_idx] = instance_id;                       // per-frame, both modes
+    if (voting_) castVote(global_idx, cid);                // accumulate a cross-frame vote
+    else         flabel_[global_idx] = cid;                // overwrite the transient label
 }
 
 void Universe::voteColor(int global_idx, unsigned char r, unsigned char g,
@@ -277,7 +299,30 @@ int Universe::pointColorCount(int i) const {
 
 int Universe::pointClassId(int i) const {
     if (i < 0 || i >= (int)flabel_.size()) return -1;
-    return flabel_[i];
+    if (!voting_) return flabel_[i];                       // naive per-frame path
+
+    // Voting mode: stuff-biased argmax over the accumulated histogram. Each class's
+    // raw vote count is weighted by stuff_bias_ if it is a Stuff class, so a thing only
+    // overtakes the leading stuff class once its votes exceed stuff's by that factor
+    // ("if classified stuff, harder to become a thing"). Ties break to the lower id, as
+    // the legacy plain-count argmax did. min_votes_/min_conf_ gate on RAW counts.
+    const auto& hist = votes_[i];
+    int   best_id = -1, best_raw = 0, total = 0;
+    float best_w = 0.0f;
+    for (const auto& pc : hist) {
+        const int   id  = pc.first;
+        const int   raw = pc.second;
+        total += raw;
+        const float w = raw * (sem_.kind(id) == ClassKind::Stuff ? stuff_bias_ : 1.0f);
+        if (w > best_w || (w == best_w && (best_id < 0 || id < best_id))) {
+            best_w = w; best_id = id; best_raw = raw;
+        }
+    }
+    if (best_id < 0) return -1;
+    if (total < min_votes_) return -1;                         // too few votes
+    if (min_conf_ > 0.0f && (float)best_raw < min_conf_ * (float)total)
+        return -1;                                             // winner too ambiguous
+    return best_id;
 }
 
 std::string Universe::pointClassName(int i) const {
@@ -299,6 +344,7 @@ void Universe::killPoint(int i) {
     alive_[i] = 0;
     if (i < (int)flabel_.size()) flabel_[i] = -1;  // also reads as unlabeled if not skipped
     if (i < (int)fiid_.size())   fiid_[i]   = -1;
+    if (i < (int)votes_.size())  votes_[i].clear();  // dead point resolves to unlabeled too
 }
 
 bool Universe::pointAlive(int i) const {

@@ -48,6 +48,16 @@ RunConfig loadRunConfig(const std::string& path) {
     p.splat      = root["splat"].as<int>(d.splat);
     p.surf_band  = root["surf_band"].as<float>(d.surf_band);
     p.things_only = root["things_only"].as<bool>(d.things_only);
+
+    // voting: { enabled, stuff_bias, min_votes, min_conf }. Persistent cross-frame
+    // vote histogram for the per-point class; off => naive per-frame labels. The stuff
+    // bias makes a point seen as stuff resist flipping to a thing.
+    YAML::Node vt = root["voting"];
+    p.voting          = vt["enabled"].as<bool>(d.voting);
+    p.vote_stuff_bias = vt["stuff_bias"].as<float>(d.vote_stuff_bias);
+    p.vote_min_votes  = vt["min_votes"].as<int>(d.vote_min_votes);
+    p.vote_min_conf   = vt["min_conf"].as<float>(d.vote_min_conf);
+
     p.endpoint   = root["endpoint"].as<std::string>(d.endpoint);
     p.thing = root["thing"].as<std::vector<std::string>>(std::vector<std::string>{
         "door", "chair", "table", "person", "trash can", "box", "monitor", "shelf", "window"});

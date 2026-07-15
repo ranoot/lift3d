@@ -75,6 +75,9 @@ public:
         inf_.setVocab(p_.thing, p_.stuff);
         inf_.reset();                                  // next frame = video frame 0
         uni_.declareVocab(p_.thing, p_.stuff);         // register thing/stuff kinds
+        // Persistent voting for the backprojected class (off => naive per-frame labels).
+        // Must follow declareVocab so the stuff bias sees the thing/stuff kinds.
+        uni_.setVoting(p_.voting, p_.vote_stuff_bias, p_.vote_min_votes, p_.vote_min_conf);
         idg_ = InstanceIdGraph{};                      // fresh instance-bridge graph per run
         done_ = 0;
         wall_.reset();

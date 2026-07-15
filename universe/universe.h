@@ -132,18 +132,39 @@ public:
                                std::vector<int>* global_indices = nullptr,
                                int zbuf_dilate = 0) const;
 
-    // ---- per-point semantics (PER-FRAME TRANSIENT) ---------------------------
-    // The label/instance-id a point carries is whatever the CURRENT frame's 2D
-    // segmentation projected onto it -- there is no cross-view vote accumulation.
-    // clearFrameLabels() resets every point to unlabeled (-1) at the start of a
-    // frame; setFrameLabel() then stamps the visible points from that frame's maps.
-    // Downstream stages run only on the current view's points, so they always read a
-    // fresh, current-frame label. (The old vote histogram is gone by design.)
+    // ---- per-point semantics -------------------------------------------------
+    // Two resolution modes, chosen by setVoting():
+    //   * NAIVE (default): the class a point carries is whatever the CURRENT frame's
+    //     2D segmentation projected onto it -- no cross-view accumulation.
+    //     clearFrameLabels() resets every point to unlabeled (-1) each frame;
+    //     setFrameLabel() then stamps the visible points from that frame's maps.
+    //   * VOTING (setVoting(true)): setFrameLabel() instead accumulates one vote per
+    //     observation into a persistent per-point histogram, and pointClassId() returns
+    //     its (stuff-biased) argmax -- so the backprojected label is a cross-frame
+    //     consensus, not the last frame's guess. Instance ids stay per-frame either way.
+    //
+    // Enable persistent voting for the per-point CLASS. stuff_bias (>= 1) up-weights
+    // stuff-class votes in the argmax, so a point that has accumulated stuff evidence
+    // (wall/floor/ceiling) resists flipping to a thing on a stray thing observation --
+    // a thing only wins once its votes exceed the leading stuff class's by that factor
+    // (curbs the occlusion/label-leak that paints objects onto walls). (min_votes,
+    // min_conf) is the optional label gate carried over from the legacy vote store: a
+    // class resolves only with >= min_votes total votes AND the winner holding >=
+    // min_conf of them; (1, 0) = plain argmax. Off => the naive per-frame path, byte
+    // for byte. Safe to call before or after points exist.
+    void setVoting(bool on, float stuff_bias = 1.0f, int min_votes = 1,
+                   float min_conf = 0.0f);
+    bool  votingEnabled() const { return voting_; }
+    float voteStuffBias() const { return stuff_bias_; }
+
     void clearFrameLabels();
-    // Stamp world point `global_idx` with this frame's class + DVIS instance id. The
-    // class NAME is interned into the shared registry (so pointClassId returns a
-    // stable id); instance_id is the raw DVIS id (-1 = background). Out-of-range
-    // indices and empty names are no-ops (empty name leaves the point unlabeled).
+    // Record this frame's observation of world point `global_idx`: class + DVIS
+    // instance id. The class NAME is interned into the shared registry (so
+    // pointClassId returns a stable id). In naive mode the class overwrites the
+    // point's transient label; in voting mode it casts one vote into the persistent
+    // histogram. The instance id (raw DVIS id, -1 = background) is stored per-frame
+    // regardless of mode. Out-of-range indices and empty names are no-ops (empty
+    // name leaves the point unlabeled / uncast).
     void setFrameLabel(int global_idx, const std::string& class_name, int instance_id);
 
     // Fuse an observed RGB colour into world point `global_idx` (running mean, so a
@@ -164,8 +185,10 @@ public:
     void declareVocab(const std::vector<std::string>& thing,
                       const std::vector<std::string>& stuff);
 
-    // Current-frame class for world point i (the label last stamped by setFrameLabel;
-    // -1 if not seen this frame).
+    // Resolved class for world point i. Naive mode: the label last stamped by
+    // setFrameLabel this frame (-1 if not seen). Voting mode: the stuff-biased argmax
+    // of the point's accumulated vote histogram, subject to the (min_votes, min_conf)
+    // gate (-1 if unvoted/gated) -- persistent across frames.
     int         pointClassId(int i)   const;   // stable registry id, -1 if unlabeled
     std::string pointClassName(int i) const;   // "" if unlabeled
     int         pointInstanceId(int i) const;  // raw DVIS instance id this frame, -1 if none
@@ -221,6 +244,24 @@ private:
     SemanticVocabulary                                sem_;
     std::vector<int>                                  flabel_;   // -1 = unlabeled
     std::vector<int>                                  fiid_;     // -1 = no instance
+
+    // ---- optional persistent voting (setVoting) ------------------------------
+    // When voting_ is on, the per-point class comes from votes_ (a sparse
+    // (class_id, count) histogram parallel to map_, accumulated across frames by
+    // setFrameLabel) instead of the transient flabel_. Stuff classes are up-weighted
+    // by stuff_bias_ in the argmax so stuff points resist flipping to a thing;
+    // min_votes_/min_conf_ are the legacy label gate. votes_ persists across frames
+    // (NOT wiped by clearFrameLabels); it is reset per-slot on kill/revive and cleared
+    // by clear(), kept parallel to map_ by integrate().
+    bool                                              voting_ = false;
+    float                                             stuff_bias_ = 1.0f;
+    int                                               min_votes_ = 1;
+    float                                             min_conf_ = 0.0f;
+    std::vector<std::vector<std::pair<std::uint16_t, std::uint16_t>>> votes_;
+
+    // Cast one vote for class id `cid` on world point `idx` (saturating). Grows the
+    // point's histogram bin; used by setFrameLabel in voting mode.
+    void castVote(int idx, int cid);
 
     // Per-point running-mean RGB (0..255) + observation count, parallel to map_.
     // Populated from camera images during voting (see voteColor); kept for

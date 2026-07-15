@@ -11,8 +11,8 @@ cam:    211
 out:    recordings/sem_universe_with_3tier_tuning.rrd
 
 # ---- accumulation window ----
-start:  600
-count:  900
+start:  0
+count:  1000
 stride: 2
 
 # ---- map + projection ----
@@ -20,16 +20,30 @@ voxel:  0.05          # world voxel fusion size (m)
 radius: 6             # fallback for proj_radius when that is unset (m); 0 => whole map
 proj_radius: 7.5      # z-buffer CANDIDATE cull radius (m) -- a projection optimization so we
                       # don't project the whole map; NOT a processing window. 0 => use radius
-tau:    0.15         # z-buffer visibility tolerance (m)
-splat:  3            # z-buffer depth dilation radius (px)
+tau:    0.17         # z-buffer visibility tolerance (m)
+splat:  2            # z-buffer depth dilation radius (px)
 surf_band: 0.75      # working-set front-surface band (m): at each pixel keep every visible
                      # point within this depth of the nearest. 0 => one point/pixel (sparse);
                      # 0.1 keeps the full front surface -> more geometry for clustering
 
 # ---- semantic labelling ----
-# Labels are PER-FRAME transient now (no cross-view vote histogram / gate): a point's
-# class is whatever the current frame's 2D segmentation projects onto it.
+# By default a point's class is whatever the current frame's 2D segmentation projects
+# onto it (naive per-frame backprojection). Turn `voting.enabled` on to accumulate a
+# persistent per-point vote histogram instead, so the label is a cross-frame consensus.
 things_only: false    # if true, only stamp object (thing) classes
+
+# ---- voting (cross-frame per-point class) ----
+# Persistent per-point vote histogram for the backprojected class. Off => naive: the
+# class is the last frame's 2D guess (no accumulation). On => every observation votes and
+# the class is the STUFF-BIASED argmax of the histogram. stuff_bias (>= 1) up-weights
+# stuff votes so a point that has been seen as stuff (wall/floor/ceiling) resists flipping
+# to a thing until things outvote stuff past that factor -- curbs objects leaking onto
+# walls/floor. min_votes/min_conf are an optional label gate (1 / 0 => plain argmax).
+voting:
+  enabled:    true   # false => per-frame transient labels (previous behaviour)
+  stuff_bias: 2.0     # weight on stuff votes in the argmax (1 => symmetric, no bias)
+  min_votes:  2       # min total votes before a class resolves (1 => off)
+  min_conf:   0.0     # min winning fraction of raw votes (0 => off)
 
 # ---- inference server + vocabulary ----
 endpoint: ipc:///tmp/inf_server.ipc
@@ -104,8 +118,8 @@ grow:
 # pipeline's primary output. Progressive merging (SGS-3D / SAI3D), not a one-shot promotion.
 objects:
   enabled:       true
-  merge_thresh:  [0.45, 0.45, 0.35, 0.30, 0.30, 0.30, 0.25]  # union bar by component level (level 1 strictest .. top loosest)
-  min_merges:    17       # merged observations a component needs before it is a reported object
+  merge_thresh:  [0.55, 0.45, 0.35, 0.30, 0.30, 0.30, 0.25, 0.25, 0.25, 0.25, 0.15]  # union bar by component level (level 1 strictest .. top loosest)
+  min_merges:    21       # merged observations a component needs before it is a reported object
   require_class: true   # only union seeds of the same thing class
   consol_stride: 1       # fold proposals only every Nth frame (skip near-duplicate adjacent views); 1 = every frame
   # ---- SAI3D global-context merging (opt-in; global_context=false => legacy single-frame path) ----
@@ -115,7 +129,7 @@ objects:
   # accumulated affinity clears the level bar with enough evidence AND a neighborhood-aggregated
   # score agrees (SAI3D judge_connect). Kills single-frame spurious bridges.
   global_context:        true  # master switch for the accumulated-affinity merge path
-  min_evidence:          1.2    # min accumulated confidence before any inter-object merge
+  min_evidence:          2.2    # min accumulated confidence before any inter-object merge
   dis_decay:             0.5    # neighborhood-aggregation decay (judge_connect)
   use_semantic_affinity: true   # include cosine(class histogram) in the per-frame deposit
   use_containment:       true   # multiply each deposit by voxel containment (shared/min(|P|,|comp|))

@@ -8,7 +8,7 @@ compile_commands.json
 # Vendored deps (each is its own git repo)
 /cppzmq/
 /libzmq/
-/hdbscan/
+# /hdbscan/
 # inf_server & mask3d_feat: our wrapper code is committed; the big upstream trees
 # (DVIS_Plus, Mask3D, MinkowskiEngine) are git submodules (see .gitmodules).
 

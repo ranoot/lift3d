@@ -10,3 +10,6 @@
 [submodule "sign-unds"]
 	path = sign-unds
 	url = https://gitlab.ai-stack.dso/cyonglia/sign-unds.git
+[submodule "hdbscan"]
+	path = hdbscan
+	url = https://github.com/wangyiqiu/hdbscan.git

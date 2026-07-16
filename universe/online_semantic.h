@@ -53,6 +53,10 @@ public:
     // Optional sign-egress hook (see semantic_pipeline.h): when set, each frame's 2D masks
     // + a pixel->3D lookup are handed out for async sign-text detection. Dormant otherwise.
     void setSignHook(SignFrameHook h)  { on_sign_    = std::move(h); }
+    // Optional segmentation-overlay hook (viz-only): when set, each frame's 2D masks are
+    // handed out so a visualizer can paint a color-coded/labelled overlay before logging
+    // the camera image. Shares the FrameResult copy with the sign hook. Dormant otherwise.
+    void setSegHook(SegOverlayHook h)  { on_seg_     = std::move(h); }
 
     // Route a FrameSource's time-synced frames into this pipeline. Call once before the
     // source's first push (it builds the source's sync engine). The source is borrowed --
@@ -116,11 +120,19 @@ public:
         FrameResult      sign_fr;
         std::vector<int> sign_pix_gidx;
         const bool       do_sign = static_cast<bool>(on_sign_);
+        const bool       do_seg  = static_cast<bool>(on_seg_);
+        // The FrameResult copy is needed by EITHER the sign or the seg-overlay consumer;
+        // pix_gidx (pixel->3D) is only needed by the sign hook.
+        const bool       want_fr = do_sign || do_seg;
         // Integrate + infer + project + stamp per-frame labels.
         stepFrameSynced(uni_, inf_, p_, sf, m, gidx, &st, use_ids ? &idg_ : nullptr,
-                        do_sign ? &sign_fr : nullptr, do_sign ? &sign_pix_gidx : nullptr);
+                        want_fr ? &sign_fr : nullptr, do_sign ? &sign_pix_gidx : nullptr);
         if (do_sign && sign_fr.ok())
             on_sign_(sf, sign_fr, sign_pix_gidx, sign_fr.w, sign_fr.h, uni_);
+        // Fire the overlay hook BEFORE the frame hook (which sets the rerun timeline), so a
+        // visualizer can stash these masks and paint them onto this frame's image.
+        if (do_seg && sign_fr.ok())
+            on_seg_(sf, sign_fr);
         prof_.add("read+integrate", st.read_integrate);
         prof_.add("infer",          st.infer);
         prof_.add("project",        st.project);
@@ -251,9 +263,10 @@ private:
     // Fed in stepFrameSynced, consulted in seedFromIndices; reset each begin().
     InstanceIdGraph idg_;
 
-    FrameHook     on_frame_;
-    ObjectsHook   on_objects_;
-    SignFrameHook on_sign_;
+    FrameHook      on_frame_;
+    ObjectsHook    on_objects_;
+    SignFrameHook  on_sign_;
+    SegOverlayHook on_seg_;
 
     int       done_ = 0;
     Profile   prof_;

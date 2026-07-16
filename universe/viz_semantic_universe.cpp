@@ -54,6 +54,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static std::string arg_str(int argc, char** argv, const char* key, const std::string& def) {
@@ -92,6 +93,93 @@ static rerun::Color superpointColor(std::uint32_t gid) {
     return rerun::Color((uint8_t)(40 + (h & 0xFF) % 200),
                         (uint8_t)(40 + ((h >> 8) & 0xFF) % 200),
                         (uint8_t)(40 + ((h >> 16) & 0xFF) % 200));
+}
+
+// Which key drives the 2D segmentation overlay colouring / labelling.
+enum class SegBy { Class, Instance };
+
+// Alpha-blend a per-segment colour into a COPY of the frame's RGB bytes. `by`==Class colours
+// each pixel by its class id (classColor -- the SAME palette as the 3D AnnotationContext
+// legend); `by`==Instance colours by DVIS instance id (superpointColor -- contrasting per
+// object, exposes over-segmentation). Background pixels (id < 0) keep the original image.
+// Instance mode needs id_map; if the server omitted it, falls back to class colouring.
+static std::vector<unsigned char> paintSegOverlay(
+    const std::vector<unsigned char>& rgb, int w, int h,
+    const FrameResult& fr, SegBy by, float alpha) {
+    std::vector<unsigned char> out = rgb;
+    const bool  have_id = fr.id_map.size() == (size_t)w * h;
+    const bool  by_inst = (by == SegBy::Instance) && have_id;
+    const float a = alpha < 0.f ? 0.f : (alpha > 1.f ? 1.f : alpha);
+    for (int v = 0; v < h; ++v) {
+        for (int u = 0; u < w; ++u) {
+            const size_t i = (size_t)v * w + u;
+            rerun::Color c;
+            if (by_inst) {
+                const int id = fr.id_map[i];
+                if (id < 0) continue;
+                c = superpointColor((std::uint32_t)id);
+            } else {
+                const int cls = fr.label_map[i];
+                if (cls < 0) continue;
+                c = classColor(cls);
+            }
+            const size_t q = i * 3;
+            out[q + 0] = (unsigned char)((1.f - a) * out[q + 0] + a * c.r());
+            out[q + 1] = (unsigned char)((1.f - a) * out[q + 1] + a * c.g());
+            out[q + 2] = (unsigned char)((1.f - a) * out[q + 2] + a * c.b());
+        }
+    }
+    return out;
+}
+
+// Parallel arrays for a rerun Boxes2D log: one labelled bounding box per segmentation region.
+struct SegBoxes {
+    std::vector<rerun::datatypes::Vec2D>  mins, sizes;
+    std::vector<rerun::Color>             colors;
+    std::vector<rerun::components::Text>  labels;
+};
+
+// One pass over the masks -> a bounding box + class-name label per region. `by`==Instance keys
+// regions by DVIS instance id (one box per object, coloured by superpointColor); `by`==Class
+// keys by class id (one box per class, coloured by classColor). Regions smaller than
+// `min_area` pixels are dropped so tiny specks don't clutter the view. Class-name comes from
+// the vocab via InfClient::className. Falls back to class-keying when id_map is absent.
+static SegBoxes segLabelBoxes(const FrameResult& fr, SegBy by, int min_area, const InfClient& inf) {
+    const int  w = fr.w, h = fr.h;
+    const bool have_id = fr.id_map.size() == (size_t)w * h;
+    const bool by_inst = (by == SegBy::Instance) && have_id;
+    struct R { int umin, vmin, umax, vmax, count, cls; };
+    std::unordered_map<int, R> regions;
+    for (int v = 0; v < h; ++v) {
+        for (int u = 0; u < w; ++u) {
+            const size_t i = (size_t)v * w + u;
+            const int cls = fr.label_map[i];
+            if (cls < 0) continue;
+            const int key = by_inst ? (int)fr.id_map[i] : cls;
+            if (key < 0) continue;
+            auto it = regions.find(key);
+            if (it == regions.end()) {
+                regions.emplace(key, R{u, v, u, v, 1, cls});
+            } else {
+                R& r = it->second;
+                r.umin = std::min(r.umin, u); r.vmin = std::min(r.vmin, v);
+                r.umax = std::max(r.umax, u); r.vmax = std::max(r.vmax, v);
+                ++r.count;
+            }
+        }
+    }
+    SegBoxes out;
+    for (const auto& kv : regions) {
+        const R& r = kv.second;
+        if (r.count < min_area) continue;
+        out.mins.push_back({(float)r.umin, (float)r.vmin});
+        out.sizes.push_back({(float)(r.umax - r.umin + 1), (float)(r.vmax - r.vmin + 1)});
+        out.colors.push_back(by_inst ? superpointColor((std::uint32_t)kv.first)
+                                     : classColor(r.cls));
+        std::string name = inf.className(r.cls);
+        out.labels.emplace_back(name.empty() ? "?" : name);
+    }
+    return out;
 }
 
 template <typename T>
@@ -337,6 +425,19 @@ int main(int argc, char** argv) {
                         .with_show_labels(false));
         };
 
+        // 2D segmentation overlay (viz-only): the seg hook stashes this frame's DVIS masks so
+        // the frame hook (which runs just after, once the timeline is set) can paint a
+        // color-coded + labelled overlay onto the camera image. Only wired when enabled, so
+        // the pipeline pays nothing (not even the FrameResult copy) otherwise.
+        const bool  seg_class = (cfg.seg_overlay == "class" || cfg.seg_overlay == "both");
+        const bool  seg_inst  = (cfg.seg_overlay == "instance" || cfg.seg_overlay == "both");
+        const bool  seg_on    = seg_class || seg_inst;
+        const float seg_alpha = cfg.seg_alpha;
+        const int   seg_min_area = cfg.seg_min_area;
+        const FrameResult* g_fr = nullptr;
+        if (seg_on)
+            online.setSegHook([&](const SyncedFrame&, const FrameResult& fr) { g_fr = &fr; });
+
         // Per-frame hook: only the LIGHTWEIGHT, genuinely time-varying entities
         // (robot pose, trajectory, camera frustum, RGB frame) plus -- on the strided
         // frames where VCCS recomputes -- the current superpoint window. The heavy
@@ -363,6 +464,31 @@ int main(int argc, char** argv) {
                             rerun::Image::from_rgb24(
                                 sf.image.rgb,
                                 {(uint32_t)sf.image.w, (uint32_t)sf.image.h}));
+
+                // Painted DVIS segmentation overlay(s) for THIS frame: color-coded fill blended
+                // into the RGB (world/camera/seg_by_{class,instance}) + a labelled box per region
+                // (.../labels). Separate entities so the raw image and each overlay toggle
+                // independently in the viewer tree. g_fr was stashed by the seg hook just before
+                // this hook fired; consume it so a frame with no inference never repaints stale.
+                if (seg_on && g_fr && g_fr->ok() && sf.image.ok() &&
+                    g_fr->w == sf.image.w && g_fr->h == sf.image.h) {
+                    const int          W  = sf.image.w, H = sf.image.h;
+                    const FrameResult& fr = *g_fr;
+                    auto logOverlay = [&](const char* ent, SegBy by) {
+                        rec.log(ent, rerun::Image::from_rgb24(
+                                         paintSegOverlay(sf.image.rgb, W, H, fr, by, seg_alpha),
+                                         {(uint32_t)W, (uint32_t)H}));
+                        SegBoxes b = segLabelBoxes(fr, by, seg_min_area, online.inf());
+                        // Always log (empty => clears the prior frame's boxes at this time).
+                        rec.log(std::string(ent) + "/labels",
+                                rerun::Boxes2D::from_mins_and_sizes(b.mins, b.sizes)
+                                    .with_colors(b.colors).with_labels(b.labels)
+                                    .with_show_labels(true));
+                    };
+                    if (seg_class) logOverlay("world/camera/seg_by_class", SegBy::Class);
+                    if (seg_inst)  logOverlay("world/camera/seg_by_instance", SegBy::Instance);
+                    g_fr = nullptr;
+                }
 
                 // Superpoints are ephemeral: log the current window ONLY when VCCS just
                 // recomputed it (version bumped) this frame, anchored at this robot pos.

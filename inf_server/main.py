@@ -18,6 +18,17 @@ from dvis_runner import DEFAULT_CONFIG, DEFAULT_WEIGHTS, DvisRunner
 
 DEFAULT_ENDPOINT = "ipc:///tmp/inf_server.ipc"
 
+# ---- tuning knobs (edit these) --------------------------------------------
+# The runner resolves each frame with VPS panoptic assignment on top of the
+# FC-CLIP geometric ensemble (see dvis_runner.py). These are the levers for
+# recall of open-vocabulary / novel classes (signs, fire extinguishers, ...).
+OBJECT_MASK_THRESH = 0.0  # VPS keep gate: drop queries whose winning class score <= this
+OVERLAP_THRESH = 0.8      # per-segment stability: min (kept / original) mask-area ratio
+ENSEMBLE_ALPHA = 0.4      # geometric-ensemble weight for SEEN (in-train) classes
+ENSEMBLE_BETA = 0.85       # geometric-ensemble weight for UNSEEN classes; raise toward 1.0
+                          # to trust CLIP more for novel classes (sign, extinguisher, ...)
+# ---------------------------------------------------------------------------
+
 
 def handle(runner: DvisRunner, req: dict) -> dict:
     cmd = req.get("cmd")
@@ -46,7 +57,13 @@ def main() -> None:
     args = ap.parse_args()
 
     runner = DvisRunner(
-        weights_path=args.weights, config_file=args.config, device=args.device
+        weights_path=args.weights,
+        config_file=args.config,
+        device=args.device,
+        object_mask_thresh=OBJECT_MASK_THRESH,
+        overlap_thresh=OVERLAP_THRESH,
+        ensemble_alpha=ENSEMBLE_ALPHA,
+        ensemble_beta=ENSEMBLE_BETA,
     )
 
     ctx = zmq.Context.instance()

@@ -13,3 +13,6 @@
 [submodule "hdbscan"]
 	path = hdbscan
 	url = https://github.com/wangyiqiu/hdbscan.git
+[submodule "inf_server/export/detectron2"]
+	path = inf_server/export/detectron2
+	url = https://github.com/facebookresearch/detectron2.git

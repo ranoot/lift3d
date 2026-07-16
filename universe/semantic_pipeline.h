@@ -209,6 +209,13 @@ using SignFrameHook = std::function<void(const SyncedFrame&, const FrameResult&,
                                          const std::vector<int>& pix_gidx,
                                          int W, int H, const Universe&)>;
 
+// Segmentation-overlay egress (optional, viz-only): fired per synced frame with this
+// frame's 2D masks (`fr`) so a visualizer can paint a color-coded + labelled overlay of
+// the DVIS segmentation onto the camera image before logging it. Like SignFrameHook it
+// only carries core types and is only fired when set (setSegHook), so the core pipeline
+// pays nothing (not even the FrameResult copy) unless a consumer attaches it.
+using SegOverlayHook = std::function<void(const SyncedFrame&, const FrameResult&)>;
+
 // One synced frame's core work: integrate geometry, infer 2D labels, project, and STAMP
 // each visible point with the current frame's class + DVIS instance id (no cross-view
 // voting -- labels are per-frame transient). `out_gidx` receives the NEAREST-PER-PIXEL

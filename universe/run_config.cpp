@@ -37,6 +37,13 @@ RunConfig loadRunConfig(const std::string& path) {
     cfg.cam = root["cam"].as<int>(cfg.cam);
     cfg.out = root["out"].as<std::string>(cfg.out);
 
+    // viz: { seg_overlay, seg_alpha, seg_min_area } -- viz-only 2D segmentation overlay
+    // painted onto the camera image. Missing keys keep the built-in defaults.
+    YAML::Node viz = root["viz"];
+    cfg.seg_overlay  = viz["seg_overlay"].as<std::string>(cfg.seg_overlay);
+    cfg.seg_alpha    = viz["seg_alpha"].as<float>(cfg.seg_alpha);
+    cfg.seg_min_area = viz["seg_min_area"].as<int>(cfg.seg_min_area);
+
     semantic::Params& p = cfg.p;
     p.start      = root["start"].as<int>(d.start);
     p.count      = root["count"].as<int>(d.count);

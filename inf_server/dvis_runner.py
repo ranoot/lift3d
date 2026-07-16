@@ -48,6 +48,7 @@ try:
     from dvis_Plus import add_minvis_config, add_dvis_config  # noqa: E402
     import ov_dvis  # noqa: E402,F401  (registers DVIS_online_OV, CLIP, decoders)
     from ov_dvis import add_ov_dvis_config  # noqa: E402
+    from ov_dvis.meta_architecture_ov import get_classification_logits  # noqa: E402
 finally:
     os.chdir(_prev_cwd)
 
@@ -92,11 +93,18 @@ class DvisRunner:
         config_file: str = DEFAULT_CONFIG,
         device: str = "cuda",
         min_size_test: int | None = None,
-        score_thr: float = 0.5,
+        object_mask_thresh: float = 0.0,
+        overlap_thresh: float = 0.8,
+        ensemble_alpha: float = 0.4,
+        ensemble_beta: float = 0.8,
     ):
         self.weights_path = weights_path
         self.device = device
-        self.score_thr = score_thr
+        # VPS panoptic-resolution + FC-CLIP geometric-ensemble knobs (see infer/_resolve_vps)
+        self.object_mask_thresh = object_mask_thresh
+        self.overlap_thresh = overlap_thresh
+        self.ensemble_alpha = ensemble_alpha
+        self.ensemble_beta = ensemble_beta
 
         cfg = get_cfg()
         add_deeplab_config(cfg)
@@ -117,6 +125,7 @@ class DvisRunner:
         self.tc = None  # text classifier (computed per vocab)
         self.nt = None  # num templates
         self.num_classes = 0
+        self.num_thing = 0  # thing count => classes_ov[:num_thing] are thing classes
         self._vocab_seq = 0
         self.keep = False  # tracker resume flag (False => next frame starts a video)
 
@@ -163,6 +172,9 @@ class DvisRunner:
         tc, nt = self.model._set_class_information(name, train=False)
         tc, nt = self.model.get_text_classifier_with_void(tc, nt, name=name)
         self.tc, self.nt, self.name, self.num_classes = tc, nt, name, len(classes_ov)
+        # classes_ov == thing + stuff, so a contiguous class id < num_thing is a thing.
+        # This is the ordering the VPS resolution and the C++ vocab both assume.
+        self.num_thing = len(thing)
         self.reset()
         return self.num_classes
 
@@ -233,45 +245,103 @@ class DvisRunner:
             m[None], size=(H0, W0), mode="bilinear", align_corners=False
         )[0]  # (q, H0, W0) logits
 
-        cls_logits = track_out["pred_logits"][0, 0]      # (q, c) incl. void column(s)
+        cls_logits = self._ensemble_class_logits(track_out, features)  # (q, c) log-probs
         embds = track_out["pred_embds"][0, :, 0].permute(1, 0)  # (q, c_emb)
-        return self._resolve_per_pixel(m, cls_logits, embds, H0, W0)
+        return self._resolve_vps(m, cls_logits, embds, H0, W0)
 
-    # --------------------------------------------------------- per-pixel resolve
-    def _resolve_per_pixel(self, mask_logits, cls_logits, embds, H, W) -> dict:
-        """Single-frame panoptic-style assignment of pixels to queries.
+    # ----------------------------------------------------- FC-CLIP geometric ensemble
+    def _ensemble_class_logits(self, track_out, features) -> torch.Tensor:
+        """Blend the tracker's in-vocab class scores with the out-of-vocab CLIP branch.
 
-        Each pixel goes to the query maximizing mask_prob * class_score; pixels
-        below ``score_thr`` are background (-1). Embeddings ride in a compact
-        per-instance table (a dense H*W*C float map is too big for IPC).
+        This is FC-CLIP's open-vocabulary mechanism (mirrors
+        ``meta_architecture_ov.py``'s ensemble at ~1283-1324, specialised to the
+        single-frame ``t == 1`` case). Without it the runner scores every query with
+        only the mask-head classifier, which is unreliable for classes absent from the
+        training vocab (signs, extinguishers, ...). Returns per-query log-probabilities
+        over ``[real classes .. void]``.
         """
-        masks = mask_logits.sigmoid()                    # (q, H, W)
-        scores = cls_logits.softmax(-1)[:, :-1]          # drop trailing void -> (q, ncls)
-        labels = scores.argmax(-1)                       # (q,)
-        qscore = scores.max(-1).values                   # (q,)
+        model = self.model
+        clip_feat = features["clip_vis_dense"]
+        # pool the dense CLIP features under each query's tracked mask (convnext path)
+        mask_for_pooling = F.interpolate(
+            track_out["pred_masks"][0].transpose(0, 1),  # (q,t,h,w) -> (t,q,h,w), t=1
+            size=clip_feat.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        pooled = model.mask_pooling(clip_feat, mask_for_pooling)      # (t, q, c)
+        pooled = model.backbone.visual_prediction_forward(pooled)     # (t, q, c_embed)
+        out_vocab = get_classification_logits(
+            pooled, self.tc, model.backbone.clip_model.logit_scale, self.nt
+        )  # (t, q, C+1)
 
-        weighted = masks * qscore[:, None, None]         # (q, H, W)
-        conf, winner = weighted.max(0)                   # (H, W), (H, W)
-        bg = conf < self.score_thr
+        in_vocab = track_out["pred_logits"][0]                        # (t, q, C+1)
+        in_probs = in_vocab[..., :-1].softmax(-1)                     # drop void -> (t,q,C)
+        out_probs = out_vocab[..., :-1].softmax(-1)
+        overlap = model.category_overlapping_mask.to(in_probs)        # (C,) 1=seen, 0=unseen
+        a, b = self.ensemble_alpha, self.ensemble_beta
+        seen = (in_probs ** (1 - a) * out_probs ** a).log() * overlap
+        unseen = (in_probs ** (1 - b) * out_probs ** b).log() * (1 - overlap)
+        cls_results = seen + unseen                                   # (t, q, C)
+        # re-attach void so void-ish queries stay suppressible by object_mask_thresh
+        is_void = in_vocab.softmax(-1)[..., -1:]                      # (t, q, 1)
+        cls_probs = torch.cat(
+            [cls_results.softmax(-1) * (1.0 - is_void), is_void], dim=-1
+        )  # (t, q, C+1)
+        return (cls_probs + 1e-8).log().mean(0)                       # (q, C+1), t-mean
 
-        id_map = winner.to(torch.int32)
-        label_map = labels[winner].to(torch.int32)
-        id_map[bg] = -1
-        label_map[bg] = -1
+    # ----------------------------------------------------- VPS panoptic per-pixel resolve
+    def _resolve_vps(self, mask_logits, cls_logits, embds, H, W) -> dict:
+        """Video-panoptic per-pixel assignment (mirrors ``inference_video_vps``, t == 1).
 
-        present = torch.unique(winner[~bg]) if (~bg).any() else winner.new_empty((0,))
-        embds_cpu = embds.detach().float().cpu().numpy()
-        labels_cpu = labels.detach().cpu().numpy()
-        qscore_cpu = qscore.detach().cpu().numpy()
-        instances = [
-            {
-                "id": int(q),
-                "label": int(labels_cpu[q]),
-                "score": float(qscore_cpu[q]),
-                "embedding": embds_cpu[q].astype(np.float32),
-            }
-            for q in present.tolist()
-        ]
+        Each kept query claims the pixels where it wins ``score * mask_prob``; a
+        per-segment stability filter (``overlap_thresh``) drops flaky masks. Thing vs
+        stuff is decided by ``class_id < num_thing`` (the ``thing + stuff`` ordering the
+        vocab guarantees). ``label_map`` carries the class index for every assigned pixel
+        (thing and stuff); ``id_map`` carries a per-instance id for thing pixels only
+        (stuff and background stay -1), which is all the downstream instance-guided
+        seeding consumes.
+        """
+        pred_cls = cls_logits.softmax(-1)                # (q, C+1)
+        scores, labels = pred_cls.max(-1)                # (q,)
+        void = pred_cls.shape[-1] - 1
+        keep = labels.ne(void) & (scores > self.object_mask_thresh)
+
+        label_map = torch.full((H, W), -1, dtype=torch.int32, device=mask_logits.device)
+        id_map = torch.full((H, W), -1, dtype=torch.int32, device=mask_logits.device)
+        instances: list[dict] = []
+
+        if keep.any():
+            cur_scores = scores[keep]
+            cur_classes = labels[keep]
+            cur_masks = mask_logits[keep].sigmoid()          # (nk, H, W) prob
+            cur_embds = embds[keep]                          # (nk, c_emb)
+            cur_prob = cur_scores.view(-1, 1, 1) * cur_masks
+            cur_mask_ids = cur_prob.argmax(0)                # (H, W) winning query per pixel
+
+            seg_id = 0
+            for k in range(cur_classes.shape[0]):
+                pred_class = int(cur_classes[k].item())
+                isthing = pred_class < self.num_thing
+                mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
+                mask_area = int(mask.sum().item())
+                original_area = int((cur_masks[k] >= 0.5).sum().item())
+                if mask_area == 0 or original_area == 0:
+                    continue
+                if mask_area / original_area < self.overlap_thresh:  # unstable segment
+                    continue
+                label_map[mask] = pred_class
+                if isthing:
+                    seg_id += 1
+                    id_map[mask] = seg_id
+                    instances.append(
+                        {
+                            "id": seg_id,
+                            "label": pred_class,
+                            "score": float(cur_scores[k].item()),
+                            "embedding": cur_embds[k].detach().float().cpu().numpy().astype(np.float32),
+                        }
+                    )
 
         return {
             "h": H,
@@ -280,3 +350,5 @@ class DvisRunner:
             "id_map": id_map.cpu().numpy().astype(np.int16),
             "instances": instances,
         }
+
+    # --------------------------------------------------------- per-pixel resolve

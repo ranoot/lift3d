@@ -18,6 +18,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 CU126="https://download.pytorch.org/whl/cu126"
 PY=${PYTHON:-python3}
 
+# pip stages large downloads in $TMPDIR before moving them to --dest. The default
+# /tmp is often a small RAM-backed tmpfs (3.9G here), and the self-contained aarch64
+# torch wheel alone is ~2.5GB -> "No space left on device". Stage on the same disk as
+# the wheelhouses instead. Override by exporting TMPDIR before running.
+export TMPDIR="${TMPDIR_OVERRIDE:-$HERE/.dltmp}"
+mkdir -p "$TMPDIR"
+
 # pip --abi is exact, so list every abi tag cp311 can consume: the version-specific
 # cp311, the stable ABI abi3, and pure-python none.
 ABIS=(--abi cp311 --abi abi3 --abi none)
@@ -37,15 +44,29 @@ fetch() {   # fetch <req-file> <out-dir> <platform-tag...>
 
     [ -f "$req" ] || { echo "MISSING $req -- run compile_requirements.sh first"; exit 1; }
     [ -d "$NOARCH" ] || { echo "MISSING $NOARCH -- run: pip wheel --no-deps -w $NOARCH 'antlr4-python3-runtime==4.9.3' 'fvcore==0.1.5.post20221221'"; exit 1; }
+    # idempotent resume: a wheelhouse that already has a torch wheel is treated as
+    # complete (rm -rf it to force a re-download).
+    if ls "$out"/torch-*.whl >/dev/null 2>&1; then
+        echo "=== SKIP $(basename "$out") (already has torch wheel; rm -rf to redo) ==="
+        return 0
+    fi
     mkdir -p "$out"
     # drop the git detectron2 line (built on target, not downloadable as a wheel)
     local tmp; tmp=$(mktemp)
     grep -v 'git+' "$req" > "$tmp"
 
     echo "=== downloading -> $(basename "$out") ==="
+    # --no-deps is essential: each requirements file is ALREADY the full uv-resolved
+    # closure for its target, so we must NOT let pip re-resolve transitive deps. If we
+    # did, pip would read torch's wheel METADATA (which lists the nvidia-*-cu12 deps
+    # behind `platform_system=="Linux" and platform_machine=="x86_64"`) and evaluate
+    # that marker against the HOST (this x86_64 Linux box) -- pulling Linux nvidia
+    # wheels into the Windows/aarch64 bundles and failing. --no-deps downloads exactly
+    # the pinned lines, no host-marker contamination.
     "$PY" -m pip download \
         --requirement "$tmp" \
         --dest "$out" \
+        --no-deps \
         --only-binary=:all: \
         --python-version 311 \
         --implementation cp \

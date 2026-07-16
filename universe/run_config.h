@@ -14,6 +14,14 @@ struct RunConfig {
     std::string out = "sem_universe.rrd";             // viz .rrd sink (viz only)
     int         cam = 211;                            // camera sensor id
     bool        spawn = false;                        // viz: stream to a live viewer
+
+    // Viz-only: paint the per-frame DVIS 2D segmentation onto the camera image (color-coded
+    // + text-labelled) before logging it, under world/camera/seg_by_{class,instance}. The
+    // core pipeline never reads these; only viz_semantic_universe does.
+    std::string seg_overlay  = "both";                // off | class | instance | both
+    float       seg_alpha    = 0.5f;                  // overlay blend strength (0..1)
+    int         seg_min_area  = 80;                   // min region px to draw a label box
+
     semantic::Params p;                               // all pipeline parameters
 };
 

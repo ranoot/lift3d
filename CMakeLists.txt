@@ -28,14 +28,17 @@ endif()
 find_package(PCL 1.3 REQUIRED)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)  # pose math in dog_log_adaptor
 
-# FetchContent is used below for yaml-cpp. The rerun C++ SDK (and its bundled Apache Arrow)
-# is intentionally GONE: all visualization moved to the Python viz_server/ (rerun + a live
-# viewer), which run_semantic_universe feeds over ZMQ. This build therefore carries no
-# rerun/Arrow dependency, so it configures on locked-down systems that cannot build Arrow.
+# FetchContent is still used for nlohmann_json in the optional sign block below. The rerun
+# C++ SDK (and its bundled Apache Arrow) is intentionally GONE: all visualization moved to the
+# Python viz_server/ (rerun + a live viewer), which run_semantic_universe feeds over ZMQ. This
+# build therefore carries no rerun/Arrow dependency, so it configures on locked-down systems
+# that cannot build Arrow.
 include(FetchContent)
 
-# yaml-cpp for the whole-pipeline YAML config (run_config). FetchContent so no system
-# -dev package is needed; skip its tests/tools to keep the build lean.
+# yaml-cpp for the whole-pipeline YAML config (run_config). Vendored as the yaml-cpp/ submodule
+# (pinned at tag 0.8.0 -- see .gitmodules) and built in-tree via add_subdirectory, so no system
+# -dev package and no network fetch are needed; skip its tests/tools to keep the build lean.
+# Fetch it first with `git submodule update --init yaml-cpp`.
 set(YAML_CPP_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_TOOLS   OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
@@ -43,9 +46,7 @@ set(YAML_CPP_INSTALL       OFF CACHE BOOL "" FORCE)
 # yaml-cpp 0.8.0 still declares cmake_minimum_required(VERSION 3.4); newer CMake has
 # removed <3.5 compatibility, so raise the policy floor just for its configure.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-FetchContent_Declare(yaml_cpp URL
-  https://github.com/jbeder/yaml-cpp/archive/refs/tags/0.8.0.tar.gz)
-FetchContent_MakeAvailable(yaml_cpp)
+add_subdirectory(yaml-cpp)
 unset(CMAKE_POLICY_VERSION_MINIMUM)
 
 include_directories(${PCL_INCLUDE_DIRS})

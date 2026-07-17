@@ -1,6 +1,5 @@
 #include "object_seeds.h"
 #include "hdbscan_extract.h"
-#include "instance_ids.h"        // InstanceIdGraph (resolves DVIS ids -> bridged instance root)
 #include "voxel_util.h"          // objutil::VKey/VHash, voxelOf (coarse-cell maturity gate)
 
 // The ONLY translation unit that pulls in the hdbscan / parlay parallel runtime, so
@@ -10,9 +9,14 @@
 #include "hdbscan/hdbscan.h"
 
 #include <pcl/filters/statistical_outlier_removal.h>   // SOR pre-filter before HDBSCAN
+#include <pcl/search/kdtree.h>                          // radius search for Euclidean split
+#include <functional>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <set>
@@ -22,6 +26,16 @@
 #include <vector>
 
 namespace {
+// Opt-in HDBSCAN input/output dump: set LIFT3D_HDB_DEBUG=1 to print, per per-class
+// clustering call, the exact point set fed to hdbscan<3> (count, xyz bounding box) and
+// the flat-cluster result (k clusters + noise count). Zero cost when the env var is unset.
+// This is the "what is HDBSCAN actually running on" probe -- the points are raw fused
+// voxel-map xyz, never splatted; splat/surf_band only decide which real points are in `mg`.
+inline bool hdbDebugOn() {
+    static const bool on = std::getenv("LIFT3D_HDB_DEBUG") != nullptr;
+    return on;
+}
+
 // The vendored hdbscan lib prints timing/diagnostics ("wspd-time", "kruskal-time",
 // "dendrogram-time", beta/rho/edges, ...) straight to std::cout on every hdbscan()
 // / dendrogram() call -- one burst per thing class per refresh. Redirect std::cout
@@ -80,6 +94,48 @@ std::vector<int> sorFilterIndices(const Universe::Cloud& cloud, const std::vecto
 
     const auto t1 = std::chrono::steady_clock::now();
     acc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return out;
+}
+
+// Split a set of global point indices into spatially-CONNECTED components at `radius` (m).
+// HDBSCAN* returns MST-connected clusters that can still span a physical gap (a small
+// sub-min_cluster_size tail glued to a dense blob across empty space never splits off in the
+// condensed tree), so one flat label can cover two visibly separate blobs. A Euclidean
+// connected-components pass at `radius` guarantees each emitted seed is spatially contiguous:
+// a solid surface (neighbors within a few voxels) stays one component; two blobs separated by
+// more than `radius` become two. radius <= 0 or <2 points => the input unchanged (one comp).
+std::vector<std::vector<int>> euclideanSplit(const Universe::Cloud& cloud,
+                                             const std::vector<int>& idx, float radius) {
+    const int m = (int)idx.size();
+    if (radius <= 0.0f || m <= 1) return {idx};
+
+    pcl::PointCloud<Universe::PointT>::Ptr sub(new pcl::PointCloud<Universe::PointT>);
+    sub->reserve(idx.size());
+    for (int g : idx) sub->push_back(cloud[g]);
+
+    pcl::search::KdTree<Universe::PointT> tree;
+    tree.setInputCloud(sub);
+
+    std::vector<int> parent(m);
+    for (int i = 0; i < m; ++i) parent[i] = i;
+    std::function<int(int)> find = [&](int a) {
+        while (parent[a] != a) { parent[a] = parent[parent[a]]; a = parent[a]; }
+        return a;
+    };
+
+    std::vector<int>   nbr;
+    std::vector<float> d2;
+    for (int i = 0; i < m; ++i) {
+        nbr.clear(); d2.clear();
+        tree.radiusSearch((*sub)[i], radius, nbr, d2);
+        for (int nb : nbr) { int ra = find(i), rb = find(nb); if (ra != rb) parent[ra] = rb; }
+    }
+
+    std::unordered_map<int, std::vector<int>> comps;
+    for (int i = 0; i < m; ++i) comps[find(i)].push_back(idx[(std::size_t)i]);
+    std::vector<std::vector<int>> out;
+    out.reserve(comps.size());
+    for (auto& kv : comps) out.push_back(std::move(kv.second));
     return out;
 }
 } // namespace
@@ -186,7 +242,7 @@ void ObjectSeeds::seedLocal(const Universe& uni, const Params& p,
 
 // PER-VIEW seeding over an explicit thing-point set (no crop, no maturity gate).
 void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& gidx,
-                                  const Params& p, InstanceIdGraph* idg) {
+                                  const Params& p) {
     ++version_;
     last_sor_ms_ = 0.0;                                 // reset per-frame SOR timing accumulator
     // Ephemeral per-frame proposals: wipe last frame's clusters + claims so this frame
@@ -277,45 +333,55 @@ void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& g
                                                       p.allow_single_cluster, p.leaf_selection);
         int k = 0;
         for (int l : labels) k = std::max(k, l + 1);
-        if (k == 0) return;
+        if (k == 0) {
+            if (hdbDebugOn())
+                std::fprintf(stderr, "[hdb] class=%d in=%d sor=%d clustered=%d -> clusters=0 "
+                             "noise=%d (all noise)\n",
+                             cid, (int)mg_in.size(), (int)mg.size(), n, n);
+            return;
+        }
         std::vector<std::vector<int>> members((std::size_t)k);
         for (int j = 0; j < n; ++j) {
             const int l = labels[j];
             if (l >= 0) members[(std::size_t)l].push_back(mg[j]);
         }
-        for (int l = 0; l < k; ++l) appendSeed(cid, members[(std::size_t)l]);
+        // Enforce spatial contiguity: split each HDBSCAN flat cluster into Euclidean-connected
+        // components so no seed spans a physical gap. One entry per FINAL seed.
+        std::vector<std::vector<int>> seeds_out;
+        for (int l = 0; l < k; ++l) {
+            if (members[(std::size_t)l].empty()) continue;
+            for (auto& comp : euclideanSplit(*cloud, members[(std::size_t)l], p.split_radius))
+                if (!comp.empty()) seeds_out.push_back(std::move(comp));
+        }
+        if (hdbDebugOn()) {
+            // Per-FINAL-seed extent (post connected-components split). If seeds are still
+            // OVERSIZE here, the blobs are genuinely linked within split_radius (lower it or
+            // look upstream at label smear); otherwise the split already broke the bridge.
+            int noise = 0; for (int l : labels) if (l < 0) ++noise;
+            std::fprintf(stderr,
+                "[hdb] class=%d in=%d sor=%d clustered=%d -> hdb_clusters=%d seeds=%d noise=%d\n",
+                cid, (int)mg_in.size(), (int)mg.size(), n, k, (int)seeds_out.size(), noise);
+            for (std::size_t s = 0; s < seeds_out.size(); ++s) {
+                const std::vector<int>& M = seeds_out[s];
+                float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+                for (int gi : M) {
+                    const Universe::PointT& pt = (*cloud)[gi];
+                    lo[0] = std::min(lo[0], pt.x); hi[0] = std::max(hi[0], pt.x);
+                    lo[1] = std::min(lo[1], pt.y); hi[1] = std::max(hi[1], pt.y);
+                    lo[2] = std::min(lo[2], pt.z); hi[2] = std::max(hi[2], pt.z);
+                }
+                const float dx = hi[0]-lo[0], dy = hi[1]-lo[1], dz = hi[2]-lo[2];
+                const float diag = std::sqrt(dx*dx + dy*dy + dz*dz);
+                std::fprintf(stderr,
+                    "        seed %zu: n=%d span=(%.2f %.2f %.2f)m diag=%.2fm%s\n",
+                    s, (int)M.size(), dx, dy, dz, diag,
+                    diag > 1.5f ? "  <-- OVERSIZE (blobs linked within split_radius)" : "");
+            }
+        }
+        for (auto& comp : seeds_out) appendSeed(cid, comp);
     };
 
     CoutSilencer silence;                              // mute the lib's per-call cout spam
-
-    // INSTANCE-GUIDED seeding (SAI3D "bridge, then split"): trust the model's instance
-    // segmentation over pure geometry. Group thing points by (class, RESOLVED instance root)
-    // -- the InstanceIdGraph has already unioned DVIS's over-segmented, physically-touching
-    // ids, so each group is one physical object -- and seed each group WHOLE (no geometric
-    // split: bridging already merged the fragments, and splitting a tracked instance would
-    // only re-fragment it). Thing points the model left without an instance id fall back to
-    // per-class geometric HDBSCAN.
-    if (idg && p.use_instance_ids) {
-        std::map<std::pair<int, int>, std::vector<int>> by_group;  // (cid, root iid) -> members
-        std::map<int, std::vector<int>>                 no_inst;   // cid -> members (iid < 0)
-        for (int g : gidx) {
-            if (g < 0 || g >= (int)cloud->size() || (!p.overlap_sets && claimed(g))) continue;
-            const int cid = uni.pointClassId(g);
-            if (cid < 0 || uni.pointClassKind(g) != ClassKind::Thing) continue;
-            const int iid = uni.pointInstanceId(g);
-            if (iid >= 0) by_group[{cid, idg->root(iid)}].push_back(g);
-            else          no_inst[cid].push_back(g);
-        }
-        // Real instances: one seed per resolved-instance group (gated on min_cluster_size so
-        // stray dust does not become an object). No HDBSCAN -- the segmentation IS the split.
-        for (const auto& kv : by_group)
-            if ((int)kv.second.size() >= p.min_cluster_size)
-                appendSeed(kv.first.first, kv.second);
-        // No-instance remainder: geometric HDBSCAN per class (the proven fallback).
-        for (const auto& kv : no_inst)
-            clusterClass(kv.first, kv.second);
-        return;
-    }
 
     if (p.single_scan) {
         // ONE hdbscan<4>: xyz + (class_slot * CLASS_GAP) as the 4th coordinate, so points
@@ -358,7 +424,11 @@ void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& g
             const int l = labels[j];
             if (l >= 0) { members[(std::size_t)l].push_back(all_g[j]); mem_cid[(std::size_t)l] = all_cid[j]; }
         }
-        for (int l = 0; l < k; ++l) appendSeed(mem_cid[(std::size_t)l], members[(std::size_t)l]);
+        for (int l = 0; l < k; ++l) {
+            if (members[(std::size_t)l].empty()) continue;
+            for (auto& comp : euclideanSplit(*cloud, members[(std::size_t)l], p.split_radius))
+                if (!comp.empty()) appendSeed(mem_cid[(std::size_t)l], comp);
+        }
         return;
     }
 

@@ -82,7 +82,6 @@ public:
         // Persistent voting for the backprojected class (off => naive per-frame labels).
         // Must follow declareVocab so the stuff bias sees the thing/stuff kinds.
         uni_.setVoting(p_.voting, p_.vote_stuff_bias, p_.vote_min_votes, p_.vote_min_conf);
-        idg_ = InstanceIdGraph{};                      // fresh instance-bridge graph per run
         done_ = 0;
         wall_.reset();
     }
@@ -101,10 +100,6 @@ public:
         // makes accumulated support reflect distinct viewpoints. <=1 => every frame.
         const bool  do_consol = do_objects &&
             (p_.consol_stride <= 1 || (done_ % p_.consol_stride) == 0);
-        // Instance-guided seeding: only bother maintaining the DVIS id-bridge graph when
-        // seeding will actually consult it (HDBSCAN on + the knob set).
-        const bool  use_ids = do_hdb && p_.hdb.use_instance_ids;
-
         // Progress heartbeat printed BEFORE the (potentially slow / server-bound)
         // inference, so you can see the run advance live and, if a server hangs, exactly
         // which frame it stalled on -- the detailed per-phase timing only prints once the
@@ -125,7 +120,7 @@ public:
         // pix_gidx (pixel->3D) is only needed by the sign hook.
         const bool       want_fr = do_sign || do_seg;
         // Integrate + infer + project + stamp per-frame labels.
-        stepFrameSynced(uni_, inf_, p_, sf, m, gidx, &st, use_ids ? &idg_ : nullptr,
+        stepFrameSynced(uni_, inf_, p_, sf, m, gidx, &st,
                         want_fr ? &sign_fr : nullptr, do_sign ? &sign_pix_gidx : nullptr);
         if (do_sign && sign_fr.ok())
             on_sign_(sf, sign_fr, sign_pix_gidx, sign_fr.w, sign_fr.h, uni_);
@@ -156,7 +151,7 @@ public:
         // Seeding runs FIRST so the seeds it births are growable + consolidatable this same
         // frame.
         if (do_hdb) {
-            os_.seedFromIndices(uni_, active, p_.hdb, use_ids ? &idg_ : nullptr);
+            os_.seedFromIndices(uni_, active, p_.hdb);
             const double t_seed = sw.lap();          // whole seeding lap (SOR + clustering)
             t_sor = os_.lastSorMs();                // SOR sub-cost, measured inside seeding
             t_hdb = t_seed - t_sor;                  // clustering only -> the two sum to t_seed
@@ -177,9 +172,8 @@ public:
             if (do_consol) {
                 // SAI3D global-context path: weight this frame's affinity deposits by how
                 // fully each primitive is seen -> build the frame's occupied-voxel shell from
-                // `gidx` (the front-surface set) and hand the DVIS id-bridge for the co-touch
-                // bonus. Both are skipped (nullptr) when global_context is off, so the legacy
-                // single-frame containment path is byte-for-byte unchanged.
+                // `gidx` (the front-surface set). Skipped (nullptr) when global_context is off,
+                // so the legacy single-frame containment path is byte-for-byte unchanged.
                 const bool gc = p_.consol_p.global_context;
                 objutil::VSet view_vox;
                 if (gc) {
@@ -191,9 +185,8 @@ public:
                                 view_vox.insert(objutil::voxelOf((*cl)[gg], invv));
                     }
                 }
-                InstanceIdGraph* cidg = (gc && p_.consol_p.use_instance_ids) ? &idg_ : nullptr;
                 obj_.consolidate(uni_, os_, p_.consol_p, p_.voxel,
-                                  gc ? &view_vox : nullptr, cidg);
+                                  gc ? &view_vox : nullptr);
                 const double lc = sw.lap();
                 prof_.add("consolidate", lc);
                 t_consol += lc;
@@ -257,11 +250,6 @@ private:
 
     // The attached input transport (borrowed; set in attach(), must outlive the run).
     FrameSource*   src_ = nullptr;
-
-    // Persistent DVIS instance-id bridge: unions same-class, physically-touching instance
-    // ids across the run so instance-guided seeding groups by resolved (bridged) instance.
-    // Fed in stepFrameSynced, consulted in seedFromIndices; reset each begin().
-    InstanceIdGraph idg_;
 
     FrameHook      on_frame_;
     ObjectsHook    on_objects_;

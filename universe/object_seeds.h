@@ -30,7 +30,6 @@
 #include <vector>
 
 class Superpoints;           // superpoints.h (pulled in by object_grow.cpp)
-class InstanceIdGraph;       // instance_ids.h (pulled in by object_seeds.cpp)
 
 // One discovered object instance: a dense HDBSCAN* cluster of same-class points,
 // possibly grown by absorbing class-consistent superpoints. `points` are universe
@@ -49,8 +48,8 @@ struct ObjectSeed {
     // spike at its class; growing re-aggregates it.
     std::vector<float> hist;
     // Raw OV-DVIS++ instance ids observed on the members (deduped): from the seed's
-    // points at birth, unioned with absorbed superpoints' ids during growLocal.
-    // Consolidation bridges seeds whose ids share a co-touch group (InstanceIdGraph).
+    // points at birth, unioned with absorbed superpoints' ids during growLocal. Retained
+    // as per-object metadata (the set of DVIS ids an object covers).
     std::vector<int>   inst_ids;
 };
 
@@ -79,13 +78,6 @@ public:
         // far-separated 4th coordinate) instead of a scan per class. false => per-class
         // hdbscan<3> loop (the proven fallback).
         bool  single_scan = true;
-        // seedFromIndices only: let the model's instance segmentation drive seeding. When
-        // true (and an InstanceIdGraph is supplied), thing points are grouped by (class,
-        // RESOLVED instance) -- the graph bridges DVIS over-segmentation so each group is
-        // one physical object -- and each such group is seeded WHOLE (no geometric split),
-        // bypassing single_scan/per-class HDBSCAN. Thing points with no instance id fall
-        // back to per-class HDBSCAN. false => the pure-geometry paths above.
-        bool  use_instance_ids = true;
         // Statistical Outlier Removal (SOR) run on each class's point set BEFORE the
         // geometric HDBSCAN paths (per-class hdbscan<3> and single_scan hdbscan<4>). For
         // each point it takes the mean distance to its `sor_mean_k` nearest neighbors and
@@ -100,6 +92,13 @@ public:
         // point is NOT removed from later clusters once claimed -- proposals may share points.
         // Off => the exclusive within-frame claim (byte-for-byte the current behaviour).
         bool  overlap_sets = false;
+        // Post-HDBSCAN Euclidean split (m): after flat extraction, break each cluster into
+        // spatially-CONNECTED components at this link radius and emit each as its own seed.
+        // HDBSCAN* clusters are MST-connected but can still bridge a physical gap (a small
+        // tail glued to a dense blob), yielding one seed over two visibly separate blobs. This
+        // enforces spatial contiguity: a solid surface stays one seed; two blobs > radius apart
+        // split. Set a touch above the voxel size so real surfaces stay whole. 0 => disabled.
+        float split_radius = 0.25f;
     };
 
     // Class-histogram-guided growing knobs (used by growLocal). Affinity of a superpoint to
@@ -137,15 +136,11 @@ public:
     // visible ∩ non-frozen ∩ thing points) instead of a robot-radius crop. No maturity
     // gate (per-view visibility replaces it); still skips already-claimed points and
     // buckets by resolved thing class. Populates each new seed's inst_ids from its
-    // members. Appends surviving clusters as new objects; bumps version().
-    //
-    // When `idg` is non-null and p.use_instance_ids is set, seeding is INSTANCE-GUIDED:
-    // thing points are grouped by (class, idg->root(instance id)) and each group is seeded
-    // whole (the model already segmented it; the graph has bridged its over-segmented ids),
-    // with only the no-instance remainder falling back to per-class HDBSCAN. `idg == nullptr`
-    // (or the flag off) reproduces the pure-geometry single_scan / per-class behaviour.
+    // members. Appends surviving clusters as new objects; bumps version(). Clustering is
+    // pure geometry: single_scan hdbscan<4> (class as a far 4th coord) or the per-class
+    // hdbscan<3> fallback.
     void seedFromIndices(const Universe& uni, const std::vector<int>& gidx,
-                         const Params& p, InstanceIdGraph* idg = nullptr);
+                         const Params& p);
 
     // GROW this frame's proposals by absorbing class-consistent, spatially-overlapping
     // superpoints from `sp` (affinity = cosine(class histograms) * containment). ALL of a

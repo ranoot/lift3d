@@ -35,8 +35,6 @@
 #include <unordered_set>
 #include <vector>
 
-class InstanceIdGraph;       // instance_ids.h (pulled in by object_consolidate.cpp)
-
 // One VIRTUAL object instance, synthesised from a Union-Find component of seeds (never
 // stored between frames). `points` is the union of the component's member seeds' live points
 // (one representative per voxel), `centroid` their mean, `level` the component's member-seed
@@ -76,8 +74,6 @@ public:
         float dis_decay           = 0.5f;   // neighborhood-aggregation decay (judge_connect)
         bool  use_semantic_affinity = true; // cosine(class hist) term in the per-frame deposit
         bool  use_containment     = true;   // fold per-frame voxel containment into the deposit
-        bool  use_instance_ids    = false;  // add an id-bonus when DVIS instance ids overlap
-        float id_bonus            = 0.25f;  // similarity boost when instance ids co-touch
         int   small_seg_min       = 0;      // mergeSmallComps: absorb comps with support < this
 
         // ---- Overlapping point-set model (opt-in; off => the exclusive-ownership path) ------
@@ -109,12 +105,10 @@ public:
     //
     // `view_vox` (optional) is the current frame's occupied-voxel set (the front-surface
     // shell): when supplied AND g.global_context is set, per-frame affinity confidence is
-    // weighted by how fully each primitive is seen this frame (SAI3D `seg_seen`). `idg`
-    // (optional) enables the instance-id co-touch bonus. Both default off => the legacy
-    // single-frame containment path, byte-for-byte.
+    // weighted by how fully each primitive is seen this frame (SAI3D `seg_seen`). Defaults
+    // off => the legacy single-frame containment path, byte-for-byte.
     void consolidate(const Universe& uni, const ObjectSeeds& seeds, const Params& g,
-                     float voxel, const objutil::VSet* view_vox = nullptr,
-                     InstanceIdGraph* idg = nullptr);
+                     float voxel, const objutil::VSet* view_vox = nullptr);
 
     // Postprocess (SAI3D merge_small_segs): absorb every component whose support is below
     // g.small_seg_min into its highest-accumulated-affinity neighbor from the edge graph;

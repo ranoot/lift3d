@@ -48,8 +48,8 @@ struct Superpoint {
     std::vector<float> hist;
 
     // Raw OV-DVIS++ instance ids observed on the members THIS frame (deduped, may be
-    // several -- one physical object often carries multiple stable ids). Consolidation
-    // bridges proposals whose ids share a co-touch group (see InstanceIdGraph).
+    // several -- one physical object often carries multiple stable ids). Aggregated into a
+    // grown object's inst_ids metadata during growLocal.
     std::vector<int> inst_ids;
 };
 

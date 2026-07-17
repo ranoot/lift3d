@@ -93,11 +93,11 @@ int main(int argc, char** argv) {
         if (p.hdbscan)
             std::printf("object proposals: per-frame seeding (visible thing set) | "
                         "min_pts=%d | min_cluster_size=%d | min_class_points=%d | "
-                        "select=%s | sor=%s(k=%d,s=%.1f) | instance_ids=%s\n",
+                        "select=%s | single_cluster=%s | sor=%s(k=%d,s=%.1f)\n",
                         p.hdb.min_pts, p.hdb.min_cluster_size, p.hdb.min_class_points,
                         p.hdb.leaf_selection ? "leaf" : "eom",
-                        p.hdb.sor_enabled ? "on" : "off", p.hdb.sor_mean_k, p.hdb.sor_std_mul,
-                        p.hdb.use_instance_ids ? "on (bridged DVIS instances)" : "off (geometry)");
+                        p.hdb.allow_single_cluster ? "on" : "off",
+                        p.hdb.sor_enabled ? "on" : "off", p.hdb.sor_mean_k, p.hdb.sor_std_mul);
         if (reader.size() == 0) return 1;
 
         // OnlineSemantic OWNS the pipeline (Universe/InfClient/Superpoints/ObjectSeeds/

@@ -103,11 +103,11 @@ RunConfig loadRunConfig(const std::string& path) {
     p.hdb.allow_single_cluster = hd["allow_single_cluster"].as<bool>(d.hdb.allow_single_cluster);
     p.hdb.leaf_selection       = hd["leaf_selection"].as<bool>(d.hdb.leaf_selection);
     p.hdb.single_scan          = hd["single_scan"].as<bool>(d.hdb.single_scan);
-    p.hdb.use_instance_ids     = hd["use_instance_ids"].as<bool>(d.hdb.use_instance_ids);
     // SOR pre-filter before the geometric HDBSCAN paths (drops sparse bridge points).
     p.hdb.sor_enabled          = hd["sor_enabled"].as<bool>(d.hdb.sor_enabled);
     p.hdb.sor_mean_k           = hd["sor_mean_k"].as<int>(d.hdb.sor_mean_k);
     p.hdb.sor_std_mul          = hd["sor_std_mul"].as<float>(d.hdb.sor_std_mul);
+    p.hdb.split_radius         = hd["split_radius"].as<float>(d.hdb.split_radius);
 
     // grow: { enabled, affinity, require_class }. Absorbs this frame's superpoints into this
     // frame's proposals; affinity = cosine(class histograms) * containment (SAI3D).
@@ -140,8 +140,6 @@ RunConfig loadRunConfig(const std::string& path) {
     p.consol_p.dis_decay             = ob["dis_decay"].as<float>(d.consol_p.dis_decay);
     p.consol_p.use_semantic_affinity = ob["use_semantic_affinity"].as<bool>(d.consol_p.use_semantic_affinity);
     p.consol_p.use_containment       = ob["use_containment"].as<bool>(d.consol_p.use_containment);
-    p.consol_p.use_instance_ids      = ob["use_instance_ids"].as<bool>(d.consol_p.use_instance_ids);
-    p.consol_p.id_bonus              = ob["id_bonus"].as<float>(d.consol_p.id_bonus);
     p.consol_p.small_seg_min         = ob["small_seg_min"].as<int>(d.consol_p.small_seg_min);
     // Overlapping point-set model: one master flag under objects:, fanned out to every stage
     // that enforces exclusivity today (seeding, growing, consolidation).

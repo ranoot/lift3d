@@ -11,7 +11,6 @@
 #include "superpoints.h"
 #include "object_seeds.h"
 #include "objects.h"
-#include "instance_ids.h"        // InstanceIdGraph (per-frame DVIS id bridging)
 #include "timing.h"
 #include "dog_stream.h"          // DogStream, SyncedFrame (pulls in dog_log_adaptor.h)
 #include "inf_client.h"
@@ -238,7 +237,6 @@ using SegOverlayHook = std::function<void(const SyncedFrame&, const FrameResult&
 inline int stepFrameSynced(Universe& uni, InfClient& inf,
                            const Params& p, const SyncedFrame& sf, PointPixelMap& out_map,
                            std::vector<int>& out_gidx, StepTiming* st = nullptr,
-                           InstanceIdGraph* idg = nullptr,
                            FrameResult* out_fr = nullptr,
                            std::vector<int>* out_pix_gidx = nullptr) {
     Stopwatch sw;
@@ -249,15 +247,6 @@ inline int stepFrameSynced(Universe& uni, InfClient& inf,
     // map (dynamic-object rejection), so the label map has to exist first.
     FrameResult fr = inf.frame(sf.image.rgb, sf.image.h, sf.image.w);
     if (st) st->infer += sw.lap();
-
-    // Bridge this frame's DVIS over-segmentation into the persistent instance graph: union
-    // same-class, physically-touching instance ids so seeding can group by resolved instance
-    // (see ObjectSeeds::seedFromIndices). Thing membership is decided on the RAW model label.
-    if (idg)
-        idg->ingestFrame(fr, [&](int lbl) {
-            return lbl >= 0 &&
-                   uni.semantics().kindOf(inf.className(lbl)) == ClassKind::Thing;
-        });
 
     // Reject dynamic-object points (people, ...) before they are ever fused, so a moving
     // object leaves no smear in the persistent world (see rejectDynamic). No-op if unset.

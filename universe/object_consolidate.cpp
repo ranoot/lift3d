@@ -1,6 +1,5 @@
 #include "objects.h"
 #include "voxel_util.h"         // objutil::VKey/VHash/VSet, voxelOf, cosine
-#include "instance_ids.h"       // InstanceIdGraph::overlaps (2D co-touch id bonus)
 
 // The proposals -> objects layer (tier 2 -> tier 3), as a single-tier Union-Find over a
 // persistent COMPONENT layer. Parlay-free: reads only Universe / ObjectSeeds + std. Each
@@ -177,7 +176,7 @@ void Objects::rebuildCache(const Universe& uni, const Params& g) {
 // -- Per-frame fold-in --------------------------------------------------------------------
 
 void Objects::consolidate(const Universe& uni, const ObjectSeeds& seeds, const Params& g,
-                          float voxel, const objutil::VSet* view_vox, InstanceIdGraph* idg) {
+                          float voxel, const objutil::VSet* view_vox) {
     Universe::Cloud::ConstPtr cloud = uni.cloud();
     if (!cloud || cloud->empty()) return;
     const std::vector<ObjectSeed>& props = seeds.list();
@@ -341,13 +340,6 @@ void Objects::consolidate(const Universe& uni, const ObjectSeeds& seeds, const P
                         if (cv.first >= 0 && cv.first < ncls)
                             ch[static_cast<std::size_t>(cv.first)] = static_cast<float>(cv.second);
                     sim = objutil::cosine(P.hist, ch);
-                }
-                // 2D co-touch bonus: if the proposal and component share a DVIS instance-id
-                // group, boost similarity (activates InstanceIdGraph::overlaps).
-                if (g.use_instance_ids && idg && !P.inst_ids.empty() && !comp_[C].ids.empty()) {
-                    std::vector<int> cids(comp_[C].ids.begin(), comp_[C].ids.end());
-                    if (idg->overlaps(P.inst_ids, cids))
-                        sim = std::min(1.0f, sim + g.id_bonus);
                 }
 
                 // Geometric containment of the proposal in this component this frame

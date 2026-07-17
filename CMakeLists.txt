@@ -109,8 +109,7 @@ set_target_properties(inf_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Universe: PCL-backed world-space point accumulator + 2D<->3D projection bridge.
 # superpoints.cpp adds VCCS oversegmentation (pcl_segmentation, already in PCL_LIBRARIES).
 add_library(universe STATIC
-  universe/universe.cpp universe/superpoints.cpp
-  universe/instance_ids.cpp)
+  universe/universe.cpp universe/superpoints.cpp)
 target_include_directories(universe
   PUBLIC universe point_pixel_mapping)
 target_link_libraries(universe

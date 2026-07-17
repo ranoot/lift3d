@@ -16,3 +16,9 @@
 [submodule "inf_server/export/detectron2"]
 	path = inf_server/export/detectron2
 	url = https://github.com/facebookresearch/detectron2.git
+[submodule "cppzmq"]
+	path = cppzmq
+	url = https://github.com/zeromq/cppzmq.git
+[submodule "libzmq"]
+	path = libzmq
+	url = https://github.com/zeromq/libzmq.git

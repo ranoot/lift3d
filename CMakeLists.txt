@@ -79,8 +79,10 @@ target_include_directories(dog_log_adaptor PUBLIC dog_log_adaptor)
 target_link_libraries(dog_log_adaptor PRIVATE Eigen3::Eigen)
 set_target_properties(dog_log_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# inf_server IPC client: cppzmq (vendored) + a hand-rolled msgpack subset. Uses the
-# vendored zmq.h headers against the system libzmq runtime (no -dev package needed).
+# inf_server IPC client: cppzmq + a hand-rolled msgpack subset. The cppzmq/ and libzmq/
+# submodules (pinned upstream zeromq clones -- see .gitmodules) supply the header-only
+# zmq.hpp / zmq.h ONLY; we link the system libzmq runtime (no -dev package needed), so
+# libzmq itself is never built. `git submodule update --init cppzmq libzmq` to fetch them.
 find_library(ZMQ_LIBRARY NAMES zmq)
 if(NOT ZMQ_LIBRARY)
   file(GLOB _zmq_cand /usr/lib/x86_64-linux-gnu/libzmq.so.5* /usr/lib/libzmq.so.5*

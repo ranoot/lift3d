@@ -114,9 +114,9 @@ int main(int argc, char** argv) {
         ObjectSeeds& os  = online.seeds();
         Objects&     obj = online.objects();
 
-        // GMD object egress (EAIRoomObject hull publisher + optional sign text) has moved out
-        // of this runner into gmd_adaptor/gmd_egress.h (gmd::GmdEgress), unwired -- see the
-        // visualizer/logic split. The runner now only feeds the Python visualizer.
+        // GMD object egress (EAIRoomObject hull publisher + optional sign text) lives in the
+        // simplified all-in-one entry point universe/semantic_runner.h (semantic::SemanticRunner,
+        // runOnInput); this runner only feeds the Python visualizer.
 
         // Visualizer egress: serialize per-frame + final state to the Python viz_server over
         // ZMQ (msgpack). Inactive (zero overhead) when cfg.viz_endpoint is empty -- the core

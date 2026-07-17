@@ -168,15 +168,23 @@ target_link_libraries(run_semantic_universe
   universe dog_log_adaptor inf_client object_seeds run_config viz_publisher
   ${PCL_LIBRARIES})
 
-# GMD object egress helper (gmd::GmdEgress), extracted out of run_semantic_universe and
-# UNWIRED -- built here so it keeps compiling (the seed of a future all-in-one entry), but
-# no executable links it. Reads the Universe, so it links `universe` (unlike the PCL-free
-# gmd_adaptor lib, which the smoke tests use).
-add_library(gmd_egress STATIC gmd_adaptor/gmd_egress.cpp)
-target_include_directories(gmd_egress PUBLIC gmd_adaptor)
-target_link_libraries(gmd_egress
-  PUBLIC universe dog_log_adaptor inf_client gmd_adaptor gmd_types ${PCL_LIBRARIES})
-set_target_properties(gmd_egress PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Simplified all-in-one entry point (semantic::SemanticRunner): encapsulates the WHOLE pipeline
+# behind a single blocking runOnInput(OpenVocabSegInput) call for the robot deployment. Owns
+# OnlineSemantic + VizPublisher + the EAIRoomObject egress; converts the GMD entity inputs to a
+# SyncedFrame and drives OnlineSemantic::onSynced directly (no DogStream -- inputs arrive already
+# synced). Supersedes the old unwired gmd_egress helper (whose collect logic moved in here).
+add_library(semantic_runner STATIC universe/semantic_runner.cpp)
+target_include_directories(semantic_runner PUBLIC universe)
+target_link_libraries(semantic_runner
+  PUBLIC universe dog_log_adaptor inf_client object_seeds run_config viz_publisher
+         gmd_adaptor gmd_types ${PCL_LIBRARIES} Eigen3::Eigen)
+set_target_properties(semantic_runner PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Offline demo/harness: replay a ~/dog_logs recording through runOnInput (stands in for the
+# robot's getSynchronizedInputs). Needs inf_server + a healthy GPU for a full run; always compiles.
+add_executable(run_on_input_demo universe/run_on_input_demo.cpp)
+target_link_libraries(run_on_input_demo
+  semantic_runner dog_log_adaptor gmd_types ${PCL_LIBRARIES})
 
 # Per-view cost + DVIS id-overlap experiment (throwaway measurement; same link set as
 # run_semantic_universe -- parlay stays confined to object_seeds via hdbscanTimeOnly).
@@ -215,9 +223,8 @@ target_link_libraries(object_publisher_check gmd_adaptor gmd_types)
 # ---------------------------------------------------------------------------------------
 # Sign-text egress (LIFT3D_USE_SIGN). Additive + optional: compiles the teammate's
 # SignUnderstanding detector chain (sign-unds/) plus our sign_adaptor bridge, and folds
-# resolved sign text into gmd_egress's EAIRoomObject::directionContent. Nothing above is
-# touched when the option is OFF. (Wires into the unwired gmd_egress helper now that the GMD
-# path has moved out of run_semantic_universe; dormant until a driver links gmd_egress.)
+# resolved sign text into semantic_runner's EAIRoomObject::directionContent. Nothing above is
+# touched when the option is OFF.
 # ---------------------------------------------------------------------------------------
 if(LIFT3D_USE_SIGN)
   find_package(CURL REQUIRED)
@@ -252,10 +259,10 @@ if(LIFT3D_USE_SIGN)
             ${JPEG_LIBRARIES} ${PNG_LIBRARIES} Eigen3::Eigen Threads::Threads)
   set_target_properties(sign_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-  # Turn on the #ifdef'd sign wiring in the gmd_egress helper and link the detector in.
-  # PUBLIC so the LIFT3D_HAVE_SIGN define (which changes GmdEgress's ABI -- adds the
-  # SignBridge member) is seen identically by anything that later links gmd_egress.
-  target_compile_definitions(gmd_egress PUBLIC LIFT3D_HAVE_SIGN)
-  target_link_libraries(gmd_egress PUBLIC sign_adaptor)
-  message(STATUS "LIFT3D_USE_SIGN: sign-text egress enabled (via gmd_egress)")
+  # Turn on the #ifdef'd sign wiring in the SemanticRunner and link the detector in. PUBLIC so
+  # the LIFT3D_HAVE_SIGN define (which changes the Impl's layout -- adds the SignBridge member)
+  # is seen identically by every TU that links semantic_runner.
+  target_compile_definitions(semantic_runner PUBLIC LIFT3D_HAVE_SIGN)
+  target_link_libraries(semantic_runner PUBLIC sign_adaptor)
+  message(STATUS "LIFT3D_USE_SIGN: sign-text egress enabled (via semantic_runner)")
 endif()

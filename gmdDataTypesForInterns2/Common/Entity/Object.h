@@ -1,3 +1,8 @@
+#pragma once
+// NOTE: this vendored header shipped WITHOUT an include guard (unlike its siblings
+// Image.h/PointCloud.h/PrimaryPose.h); the #pragma once above was added so it can be pulled
+// in via more than one path in a single TU without redefining EAIRoomObject. It still relies
+// on the includer having pulled in <vector> first (see object_publisher.h's note).
 #include <string>
 #include "GMDBase/Entity/TimeStamp.h"
 

@@ -17,7 +17,7 @@ readme = "README.md"
 # torchvision is pinned bare (no +cu126 local tag) on purpose: pytorch's cu126
 # index publishes the aarch64 torchvision wheel WITHOUT the +cu126 local version
 # (x86_64 gets 0.21.0+cu126), and a bare `==0.21.0` matches both per PEP 440.
-requires-python = "==3.11.*"
+requires-python = "==3.10.*"
 dependencies = [
     # IPC
     "pyzmq==26.4.0",

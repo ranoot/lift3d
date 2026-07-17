@@ -30,3 +30,6 @@ compile_commands.json
 # ONNX export sidequest (standalone, not part of the live pipeline)
 /dvis_export/
 EOF
+
+# export sidequest
+/inf_server/export/

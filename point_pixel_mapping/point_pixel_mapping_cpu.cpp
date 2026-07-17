@@ -5,6 +5,7 @@
 
 #include "point_pixel_mapping.cuh"
 
+#include <algorithm>
 #include <vector>
 #include <limits>
 #include <cmath>
@@ -17,11 +18,18 @@ int projectPointsToPixels(const float* points_xyz,
                           float*       out_depth,
                           unsigned char* out_visible,
                           int*         out_corr,
-                          int          zbuf_dilate)
+                          int          zbuf_dilate,
+                          int          splat_min,
+                          float        splat_world)
 {
     if (N <= 0) return 0;
     const int W = cam.width, H = cam.height;
-    const int r = zbuf_dilate > 0 ? zbuf_dilate : 0;   // depth splat radius (px)
+    const int r_max = zbuf_dilate > 0 ? zbuf_dilate : 0;   // splat radius / cap (px)
+    // Perspective-correct splat: a point at depth c gets a radius sized to one
+    // voxel's image footprint. k_px = fx * splat_world is that footprint at unit
+    // depth; the per-point radius is k_px / c, clamped to [splat_min, r_max].
+    // splat_world <= 0 => the legacy constant radius r_max.
+    const float k_px = splat_world > 0.0f ? cam.K[0] * splat_world : 0.0f;
 
     float M[12];
     buildProjection(cam, M);
@@ -56,6 +64,11 @@ int projectPointsToPixels(const float* points_xyz,
 
         out_uv[2 * i + 0] = u;
         out_uv[2 * i + 1] = v;
+
+        // Depth-scaled radius (constant r_max in the legacy path, k_px == 0).
+        const int r = k_px > 0.0f
+            ? std::clamp((int)std::lround(k_px / c), splat_min, r_max)
+            : r_max;
 
         const int u0 = u - r > 0 ? u - r : 0;
         const int u1 = u + r < W - 1 ? u + r : W - 1;

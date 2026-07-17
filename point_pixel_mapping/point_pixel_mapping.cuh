@@ -88,6 +88,19 @@ inline void buildProjection(const Camera& cam, float M[12]) {
 //   wall that lands in a hole pixel is nobody's occludee and leaks through as
 //   "visible". r>=1 lets a nearby surface voxel win the hole and occlude it.
 //   Per-point (u,v) is always the exact centre pixel; only the depth test dilates.
+//   When splat_world > 0 (below), zbuf_dilate is instead the CAP (r_max) on the
+//   depth-scaled radius, not a constant.
+// splat_min  : lower clamp on the depth-scaled radius (see splat_world). Ignored
+//   when splat_world <= 0.
+// splat_world: PERSPECTIVE-CORRECT splat. A world length in metres (typically the
+//   map voxel size * an overlap factor). The hole a sparse voxel cloud leaves in
+//   the image scales with 1/depth, so a single constant radius either under-fills
+//   near surfaces (occluded points leak) or over-halos far ones (visible surfaces
+//   self-occlude). With splat_world > 0 the radius is instead sized to one voxel's
+//   image footprint at each point's depth:
+//       r(c) = clamp( round( fx * splat_world / c ), splat_min, zbuf_dilate )
+//   where fx = cam.K[0] and c is the point's camera-space depth (a square window;
+//   assumes fx ~ fy). splat_world <= 0 => the legacy constant radius r = zbuf_dilate.
 // Outputs (all caller-allocated, host):
 //   out_uv      : N*2 ints, integer pixel (u,v) per point; (-1,-1) if behind cam
 //                 or out of frame. Same indices the z-buffer used.
@@ -103,7 +116,9 @@ int projectPointsToPixels(const float* points_xyz,
                           float*       out_depth,
                           unsigned char* out_visible,
                           int*         out_corr,
-                          int          zbuf_dilate = 0);
+                          int          zbuf_dilate = 0,
+                          int          splat_min   = 0,
+                          float        splat_world = 0.0f);
 
 // ---------------------------------------------------------------------------
 // Ergonomic wrapper. Owns its output buffers (no caller pre-allocation) and
@@ -127,10 +142,13 @@ struct PointPixelMap {
 
 // One-call mapping: allocates the buffers, runs the backend, returns the result.
 // Check .ok() before trusting the contents (false only on a CUDA error).
-// zbuf_dilate is the depth splat radius (see projectPointsToPixels).
+// zbuf_dilate / splat_min / splat_world control the depth splat (see
+// projectPointsToPixels): splat_world > 0 => depth-scaled radius capped at
+// zbuf_dilate; splat_world <= 0 => legacy constant radius zbuf_dilate.
 inline PointPixelMap mapPointsToPixels(const float* points_xyz, int N,
                                        const Camera& cam, float tau_vis,
-                                       int zbuf_dilate = 0) {
+                                       int zbuf_dilate = 0, int splat_min = 0,
+                                       float splat_world = 0.0f) {
     PointPixelMap m;
     m.N = N;
     m.uv.assign(N > 0 ? (size_t)2 * N : 0, -1);
@@ -140,14 +158,15 @@ inline PointPixelMap mapPointsToPixels(const float* points_xyz, int N,
     m.num_visible = projectPointsToPixels(points_xyz, N, cam, tau_vis,
                                           m.uv.data(), m.depth.data(),
                                           m.visible.data(), m.corr.data(),
-                                          zbuf_dilate);
+                                          zbuf_dilate, splat_min, splat_world);
     return m;
 }
 
 // Same, taking a flat xyz vector (size must be a multiple of 3).
 inline PointPixelMap mapPointsToPixels(const std::vector<float>& points_xyz,
                                        const Camera& cam, float tau_vis,
-                                       int zbuf_dilate = 0) {
+                                       int zbuf_dilate = 0, int splat_min = 0,
+                                       float splat_world = 0.0f) {
     return mapPointsToPixels(points_xyz.data(), (int)(points_xyz.size() / 3),
-                             cam, tau_vis, zbuf_dilate);
+                             cam, tau_vis, zbuf_dilate, splat_min, splat_world);
 }

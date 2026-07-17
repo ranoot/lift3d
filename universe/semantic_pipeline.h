@@ -121,7 +121,15 @@ struct Params {
     float proj_radius = 0.0f; // >0 => cap the z-buffer candidate crop tighter than
                               // `radius` (fewer points projected); <=0 => use `radius`
     float tau   = 0.1f;    // z-buffer visibility tolerance (m)
-    int   splat = 1;       // z-buffer depth dilation radius (px); 0 = single pixel
+    int   splat = 1;       // z-buffer depth dilation radius (px); 0 = single pixel.
+                           // With splat_mult > 0 this is the CAP (r_max) on the
+                           // depth-scaled radius instead of a constant.
+    // Perspective-correct splat: the splat radius is sized to one voxel's image
+    // footprint at each point's depth, r(c) = clamp(round(fx*voxel*splat_mult/c),
+    // splat_min, splat). Fixes the fixed-radius tradeoff (near holes leak / far
+    // halos self-occlude). splat_mult <= 0 => the legacy constant radius `splat`.
+    float splat_mult = 0.0f; // overlap factor on the voxel footprint; 0 => legacy
+    int   splat_min  = 2;    // lower clamp on the depth-scaled radius (px)
     // Per-pixel front-surface band (m) for the working set: keep every visible point within
     // this depth of the nearest at its pixel. 0 => one point per pixel (tightest); larger =>
     // the full front surface at each pixel (more geometry for superpoints/HDBSCAN). Does not
@@ -263,8 +271,10 @@ inline int stepFrameSynced(Universe& uni, InfClient& inf,
     // candidate crop tighter than the feature/grow `radius` when set, else falls back.
     const float pr = p.proj_radius > 0.0f ? p.proj_radius : p.radius;
     std::vector<int> gidx;
-    out_map = (pr > 0.0f) ? uni.projectLocal(view, p.tau, pr, &gidx, p.splat)
-                          : uni.project(view, p.tau, p.splat);
+    const float splat_world = p.voxel * p.splat_mult;   // 0 => legacy constant splat
+    out_map = (pr > 0.0f)
+        ? uni.projectLocal(view, p.tau, pr, &gidx, p.splat, p.splat_min, splat_world)
+        : uni.project(view, p.tau, p.splat, p.splat_min, splat_world);
     if (st) st->project += sw.lap();
 
     // Reduce the visible set to the FRONT-SURFACE SHELL per pixel. Pass 1: find the nearest

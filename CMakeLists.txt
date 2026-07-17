@@ -28,15 +28,11 @@ endif()
 find_package(PCL 1.3 REQUIRED)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)  # pose math in dog_log_adaptor
 
-# Rerun C++ SDK for the visualizer (viz_universe). FetchContent downloads the
-# prebuilt SDK zip and builds the bundled Apache Arrow from source -- that Arrow
-# build is heavy, so throttle the first build (e.g. `cmake --build build -j1`) on
-# RAM-limited machines. To skip the Arrow build, install libarrow and configure
-# with -DRERUN_DOWNLOAD_AND_BUILD_ARROW=OFF.
+# FetchContent is used below for yaml-cpp. The rerun C++ SDK (and its bundled Apache Arrow)
+# is intentionally GONE: all visualization moved to the Python viz_server/ (rerun + a live
+# viewer), which run_semantic_universe feeds over ZMQ. This build therefore carries no
+# rerun/Arrow dependency, so it configures on locked-down systems that cannot build Arrow.
 include(FetchContent)
-FetchContent_Declare(rerun_sdk URL
-  https://github.com/rerun-io/rerun/releases/download/0.33.1/rerun_cpp_sdk.zip)
-FetchContent_MakeAvailable(rerun_sdk)
 
 # yaml-cpp for the whole-pipeline YAML config (run_config). FetchContent so no system
 # -dev package is needed; skip its tests/tools to keep the build lean.
@@ -105,6 +101,11 @@ target_include_directories(inf_client
 target_link_libraries(inf_client PUBLIC ${ZMQ_LIBRARY})
 set_target_properties(inf_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Viz egress: serialize per-frame + final pipeline state onto a ZMQ PUSH socket (msgpack,
+# via inf_client's msgpack_lite.h) for the Python viz_server. Same cppzmq/libzmq include +
+# ndarray-envelope pattern as inf_client; reads the Universe/Superpoints/... types (defined
+# after this, so linked below where universe exists).
+
 # Universe: PCL-backed world-space point accumulator + 2D<->3D projection bridge.
 # superpoints.cpp adds VCCS oversegmentation (pcl_segmentation, already in PCL_LIBRARIES).
 add_library(universe STATIC
@@ -151,16 +152,32 @@ target_link_libraries(run_config
   PRIVATE yaml-cpp)
 set_target_properties(run_config PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Semantic Universe: accumulate + lift inf_server 2D labels onto every world point.
+# Viz egress lib (declared here, after `universe` exists): PUSH-socket msgpack publisher.
+add_library(viz_publisher STATIC universe/viz_publisher.cpp)
+target_include_directories(viz_publisher
+  PUBLIC universe
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cppzmq ${CMAKE_CURRENT_SOURCE_DIR}/libzmq/include)
+target_link_libraries(viz_publisher
+  PUBLIC universe dog_log_adaptor inf_client ${ZMQ_LIBRARY} ${PCL_LIBRARIES})
+set_target_properties(viz_publisher PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Semantic Universe: accumulate + lift inf_server 2D labels onto every world point, and
+# (when --viz / viz_endpoint is set) stream per-frame + final state to the Python viz_server.
+# Carries NO rerun/arrow dependency -- all rendering lives in viz_server/.
 add_executable(run_semantic_universe universe/run_semantic_universe.cpp)
 target_link_libraries(run_semantic_universe
-  universe dog_log_adaptor inf_client object_seeds run_config gmd_adaptor gmd_types
+  universe dog_log_adaptor inf_client object_seeds run_config viz_publisher
   ${PCL_LIBRARIES})
 
-# Rerun visualizer for the semantic map (world coloured by class + RGB frames).
-add_executable(viz_semantic_universe universe/viz_semantic_universe.cpp)
-target_link_libraries(viz_semantic_universe
-  universe dog_log_adaptor inf_client object_seeds run_config ${PCL_LIBRARIES} rerun_sdk)
+# GMD object egress helper (gmd::GmdEgress), extracted out of run_semantic_universe and
+# UNWIRED -- built here so it keeps compiling (the seed of a future all-in-one entry), but
+# no executable links it. Reads the Universe, so it links `universe` (unlike the PCL-free
+# gmd_adaptor lib, which the smoke tests use).
+add_library(gmd_egress STATIC gmd_adaptor/gmd_egress.cpp)
+target_include_directories(gmd_egress PUBLIC gmd_adaptor)
+target_link_libraries(gmd_egress
+  PUBLIC universe dog_log_adaptor inf_client gmd_adaptor gmd_types ${PCL_LIBRARIES})
+set_target_properties(gmd_egress PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Per-view cost + DVIS id-overlap experiment (throwaway measurement; same link set as
 # run_semantic_universe -- parlay stays confined to object_seeds via hdbscanTimeOnly).
@@ -199,8 +216,9 @@ target_link_libraries(object_publisher_check gmd_adaptor gmd_types)
 # ---------------------------------------------------------------------------------------
 # Sign-text egress (LIFT3D_USE_SIGN). Additive + optional: compiles the teammate's
 # SignUnderstanding detector chain (sign-unds/) plus our sign_adaptor bridge, and folds
-# resolved sign text into run_semantic_universe's EAIRoomObject::directionContent. Nothing
-# above is touched when the option is OFF.
+# resolved sign text into gmd_egress's EAIRoomObject::directionContent. Nothing above is
+# touched when the option is OFF. (Wires into the unwired gmd_egress helper now that the GMD
+# path has moved out of run_semantic_universe; dormant until a driver links gmd_egress.)
 # ---------------------------------------------------------------------------------------
 if(LIFT3D_USE_SIGN)
   find_package(CURL REQUIRED)
@@ -235,8 +253,10 @@ if(LIFT3D_USE_SIGN)
             ${JPEG_LIBRARIES} ${PNG_LIBRARIES} Eigen3::Eigen Threads::Threads)
   set_target_properties(sign_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-  # Turn on the #ifdef'd bridge wiring in the runner and link the egress in.
-  target_compile_definitions(run_semantic_universe PRIVATE LIFT3D_HAVE_SIGN)
-  target_link_libraries(run_semantic_universe sign_adaptor)
-  message(STATUS "LIFT3D_USE_SIGN: sign-text egress enabled")
+  # Turn on the #ifdef'd sign wiring in the gmd_egress helper and link the detector in.
+  # PUBLIC so the LIFT3D_HAVE_SIGN define (which changes GmdEgress's ABI -- adds the
+  # SignBridge member) is seen identically by anything that later links gmd_egress.
+  target_compile_definitions(gmd_egress PUBLIC LIFT3D_HAVE_SIGN)
+  target_link_libraries(gmd_egress PUBLIC sign_adaptor)
+  message(STATUS "LIFT3D_USE_SIGN: sign-text egress enabled (via gmd_egress)")
 endif()

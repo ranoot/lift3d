@@ -50,6 +50,21 @@ public:
         else { buf.push_back(0xcf); be64(v); }
     }
 
+    // Signed int: non-negative routes through the compact uint path; negatives use a
+    // fixed int64 (0xd3), which Reader decodes symmetrically. Kept simple -- viz sends
+    // only a handful of possibly-negative scalars (class ids: -1 == unlabeled).
+    void integer(int64_t v) {
+        if (v >= 0) { uint((uint64_t)v); return; }
+        if (v >= -32) { buf.push_back((uint8_t)v); return; }        // negative fixint
+        buf.push_back(0xd3); be64((uint64_t)v);
+    }
+
+    // IEEE-754 double (msgpack float64, tag 0xcb). Reader handles it via std::memcpy.
+    void f64(double v) {
+        uint64_t r; std::memcpy(&r, &v, 8);
+        buf.push_back(0xcb); be64(r);
+    }
+
 private:
     void u8(uint8_t v) { buf.push_back(v); }
     void be(uint32_t v, int bytes) {                     // big-endian, low `bytes`

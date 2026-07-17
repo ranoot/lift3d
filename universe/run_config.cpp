@@ -43,6 +43,10 @@ RunConfig loadRunConfig(const std::string& path) {
     cfg.seg_overlay  = viz["seg_overlay"].as<std::string>(cfg.seg_overlay);
     cfg.seg_alpha    = viz["seg_alpha"].as<float>(cfg.seg_alpha);
     cfg.seg_min_area = viz["seg_min_area"].as<int>(cfg.seg_min_area);
+    // ZMQ endpoint the runner pushes viz messages to (empty => no visualizer). Accepts a
+    // top-level `viz_endpoint:` or a `viz: { endpoint: ... }` nested key.
+    cfg.viz_endpoint = root["viz_endpoint"].as<std::string>(
+                           viz["endpoint"].as<std::string>(cfg.viz_endpoint));
 
     semantic::Params& p = cfg.p;
     p.start      = root["start"].as<int>(d.start);
@@ -53,6 +57,8 @@ RunConfig loadRunConfig(const std::string& path) {
     p.proj_radius = root["proj_radius"].as<float>(d.proj_radius);
     p.tau        = root["tau"].as<float>(d.tau);
     p.splat      = root["splat"].as<int>(d.splat);
+    p.splat_mult = root["splat_mult"].as<float>(d.splat_mult);
+    p.splat_min  = root["splat_min"].as<int>(d.splat_min);
     p.surf_band  = root["surf_band"].as<float>(d.surf_band);
     p.things_only = root["things_only"].as<bool>(d.things_only);
 

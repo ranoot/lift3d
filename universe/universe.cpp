@@ -212,22 +212,25 @@ std::vector<float> xyzOf(const Universe::Cloud& c) {
 }
 } // namespace
 
-PointPixelMap Universe::project(int view_id, float tau_vis, int zbuf_dilate) const {
+PointPixelMap Universe::project(int view_id, float tau_vis, int zbuf_dilate,
+                                int splat_min, float splat_world) const {
     const View& v = views_.at(view_id);
     std::vector<float> xyz = xyzOf(*map_);
-    return mapPointsToPixels(xyz.data(), size(), v.cam, tau_vis, zbuf_dilate);
+    return mapPointsToPixels(xyz.data(), size(), v.cam, tau_vis, zbuf_dilate,
+                             splat_min, splat_world);
 }
 
 PointPixelMap Universe::projectLocal(int view_id, float tau_vis, float radius,
                                      std::vector<int>* global_indices,
-                                     int zbuf_dilate) const {
+                                     int zbuf_dilate, int splat_min,
+                                     float splat_world) const {
     const View& v = views_.at(view_id);
     const float r = (radius < 0.0f) ? local_radius_ : radius;
 
     Cloud::Ptr sub = local(v.robot, r, global_indices);
     std::vector<float> xyz = xyzOf(*sub);
     return mapPointsToPixels(xyz.data(), static_cast<int>(sub->size()), v.cam,
-                             tau_vis, zbuf_dilate);
+                             tau_vis, zbuf_dilate, splat_min, splat_world);
 }
 
 // ---- per-point semantics (per-frame transient) -------------------------------

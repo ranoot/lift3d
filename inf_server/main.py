@@ -22,11 +22,21 @@ DEFAULT_ENDPOINT = "ipc:///tmp/inf_server.ipc"
 # The runner resolves each frame with VPS panoptic assignment on top of the
 # FC-CLIP geometric ensemble (see dvis_runner.py). These are the levers for
 # recall of open-vocabulary / novel classes (signs, fire extinguishers, ...).
-OBJECT_MASK_THRESH = 0.0  # VPS keep gate: drop queries whose winning class score <= this
-OVERLAP_THRESH = 0.8      # per-segment stability: min (kept / original) mask-area ratio
-ENSEMBLE_ALPHA = 0.4      # geometric-ensemble weight for SEEN (in-train) classes
-ENSEMBLE_BETA = 0.85       # geometric-ensemble weight for UNSEEN classes; raise toward 1.0
+OBJECT_MASK_THRESH = 0.08  # VPS keep gate: drop queries whose winning class score <= this
+OVERLAP_THRESH = 0.7      # per-segment stability: min (kept / original) mask-area ratio
+ENSEMBLE_ALPHA = 0.3      # geometric-ensemble weight for SEEN (in-train) classes
+ENSEMBLE_BETA = 1.3       # geometric-ensemble weight for UNSEEN classes; raise toward 1.0
                           # to trust CLIP more for novel classes (sign, extinguisher, ...)
+
+# Per-class synonyms. Key = the canonical class name EXACTLY as spelled in run.yaml's
+# `thing:`/`stuff:` list; value = extra phrasings. The model embeds every synonym and keeps
+# the best-matching one per pixel (max-ensemble), so more phrasings only raise recall.
+# Classes not listed here are used as-is. These strings stay inside Python -- the C++ side
+# never sees them, so object labels / topics / dynamic-class matching keep the clean name.
+SYNONYMS: dict[str, list[str]] = {
+    "extinguisher": ["fire extinguisher", "red fire extinguisher", "wall-mounted extinguisher"],
+    "sign":         ["label", "label with text", "signage", "placard", "wall sign", "paper", "paper with text", "Plaque with text", "Sticker with text", "Neon Sign", "Signpost", "sign with text"],
+}
 # ---------------------------------------------------------------------------
 
 
@@ -64,6 +74,7 @@ def main() -> None:
         overlap_thresh=OVERLAP_THRESH,
         ensemble_alpha=ENSEMBLE_ALPHA,
         ensemble_beta=ENSEMBLE_BETA,
+        synonyms=SYNONYMS,
     )
 
     ctx = zmq.Context.instance()

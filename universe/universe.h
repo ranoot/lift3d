@@ -123,14 +123,18 @@ public:
     // world points (0..size()-1). zbuf_dilate splats the z-buffer depth into a
     // (2r+1)^2 window so the sparse voxel map occludes as a continuous surface (see
     // projectPointsToPixels); leave 0 for the legacy single-pixel behaviour.
-    PointPixelMap project(int view_id, float tau_vis, int zbuf_dilate = 0) const;
+    // splat_world > 0 makes the splat radius depth-scaled (capped at zbuf_dilate,
+    // floored at splat_min); see projectPointsToPixels.
+    PointPixelMap project(int view_id, float tau_vis, int zbuf_dilate = 0,
+                          int splat_min = 0, float splat_world = 0.0f) const;
     // Project only the local region around that view's robot centre (radius < 0
     // uses localRadius()). The returned map indexes the LOCAL subset; if
     // global_indices is given, global_indices[i] is the world index of local
     // point i -- so per-pixel results lift back onto the global map.
     PointPixelMap projectLocal(int view_id, float tau_vis, float radius = -1.0f,
                                std::vector<int>* global_indices = nullptr,
-                               int zbuf_dilate = 0) const;
+                               int zbuf_dilate = 0, int splat_min = 0,
+                               float splat_world = 0.0f) const;
 
     // ---- per-point semantics -------------------------------------------------
     // Two resolution modes, chosen by setVoting():

@@ -1,0 +1,17 @@
+[project]
+name = "viz-server"
+version = "0.1.0"
+description = "Rerun visualizer for the lift3d semantic Universe (ZMQ/msgpack consumer)"
+readme = "README.md"
+# The visualizer half of the visualizer/logic split: run_semantic_universe streams the
+# pipeline state over ZMQ (msgpack), and this process owns ALL rerun rendering + the live
+# viewer. Rerun/Arrow live only here, so the C++ build carries no such dependency and can
+# be built on a locked-down system. rerun-sdk is pinned to the same version as the (now
+# removed) C++ SDK so recordings stay format-compatible.
+requires-python = ">=3.10"
+dependencies = [
+    "rerun-sdk==0.33.1",
+    "pyzmq==26.4.0",
+    "msgpack>=1.0",
+    "numpy>=1.24",
+]

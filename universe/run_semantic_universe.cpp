@@ -6,9 +6,12 @@
 //
 // Usage:
 //   run_semantic_universe --config run.yaml [--log <folder>] [--out labeled.pcd]
+//       [--viz <zmq-endpoint>]
 //
 // Requires the inf_server running. See run.yaml for every tunable; the stored semantics
-// key on class *names*, so changing the vocabulary never corrupts the map.
+// key on class *names*, so changing the vocabulary never corrupts the map. Pass --viz (or
+// set viz_endpoint in the config) to stream per-frame + final state to the Python viz_server
+// (viz_server/), which owns all rerun rendering -- this binary carries no rerun/arrow dep.
 
 #include "universe.h"
 #include "superpoints.h"
@@ -20,10 +23,7 @@
 #include "inf_client.h"
 #include "semantic_pipeline.h"
 #include "online_semantic.h"
-#include "object_publisher.h"   // gmd:: EAIRoomObject egress (2D overhead hull + keyed topic)
-#ifdef LIFT3D_HAVE_SIGN
-#include "sign_bridge.h"        // sign:: async sign-text egress (LIFT3D_USE_SIGN builds only)
-#endif
+#include "viz_publisher.h"      // VizPublisher: stream per-frame + final state to the Python viz
 
 #include <pcl/io/pcd_io.h>
 
@@ -49,7 +49,8 @@ static bool has_flag(int argc, char** argv, const char* key) {
 int main(int argc, char** argv) {
     if (!has_flag(argc, argv, "--config")) {
         std::fprintf(stderr,
-            "usage: %s --config run.yaml [--log <folder>] [--out labeled.pcd]\n",
+            "usage: %s --config run.yaml [--log <folder>] [--out labeled.pcd] "
+            "[--viz <zmq-endpoint>]\n",
             argv[0]);
         return 2;
     }
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
     }
     cfg.log = arg_str(argc, argv, "--log", cfg.log);   // CLI overrides
     std::string out = arg_str(argc, argv, "--out", ""); // labeled PCD (optional)
+    cfg.viz_endpoint = arg_str(argc, argv, "--viz", cfg.viz_endpoint); // "" => headless
     semantic::Params& p = cfg.p;
 
     try {
@@ -69,9 +71,9 @@ int main(int argc, char** argv) {
         DogLogReader reader(cfg.log + "/PoseAndPointClouds.bin");
         reader.openCamera(cfg.log + "/camera" + std::to_string(cfg.cam) + ".gclf");
         std::printf("scans=%d images=%d | cam %d %dx%d | voxel %.3f | radius %.2f | "
-                    "tau %.2f | splat %d\n",
+                    "tau %.2f | splat %d (mult %.2f min %d)\n",
                     reader.size(), reader.numImages(), cam.sensor_id, cam.width, cam.height,
-                    p.voxel, p.radius, p.tau, p.splat);
+                    p.voxel, p.radius, p.tau, p.splat, p.splat_mult, p.splat_min);
         if (p.superpoints)
             std::printf("superpoints: VCCS seed=%.2f per-frame (FULL view incl. stuff) | "
                         "thing_frac=%.2f\n", p.sp.seed_res, p.sp.thing_frac);
@@ -106,85 +108,63 @@ int main(int argc, char** argv) {
         if (!online.inf().ping()) { std::fprintf(stderr, "inf_server not responding at %s\n",
                                                  p.endpoint.c_str()); return 1; }
 
-        // Bind live references to the owned stages for the post-run reads / hook below.
+        // Bind live references to the owned stages for the post-run reads / viz hook below.
         Universe&    uni = online.universe();
         Superpoints& sp  = online.superpoints();
         ObjectSeeds& os  = online.seeds();
         Objects&     obj = online.objects();
-        // The objects hook returns the EAIRoomObjects to upsert into the global store: each
-        // universe Object becomes an EAIRoomObject whose polygon is a 2D overhead (X-Y, world is
-        // Z-up) convex hull of its member points, cleaned with a kNN statistical-outlier pass.
-        // Writing an objectId that already exists overwrites it (updated); a new id is created.
-        // NOTE: Object::id is a Union-Find root that can change when components merge, so id
-        // stability is bounded by that root; a persistent id would come from the instance-id layer.
-        const auto vehicle_id = static_cast<uint16_t>(cfg.cam);
-        // `dir` (optional): object id -> directionContent from resolved sign text. When present,
-        // an object that encompasses a sign carries its text; others stay "". Null in a non-sign
-        // build, so directionContent is unchanged there.
-        auto collectEAIObjects = [](const std::vector<Object>& objs, const Universe& u,
-                                    uint16_t vehicleId,
-                                    const std::unordered_map<int, std::string>* dir) {
-            std::vector<gmd::EAIRoomObject> updates;
-            Universe::Cloud::ConstPtr cloud = u.cloud();
-            std::vector<std::array<float, 3>> xyz;
-            for (const Object& o : objs) {
-                xyz.clear();
-                xyz.reserve(o.points.size());
-                for (int gid : o.points) {
-                    if (gid < 0 || gid >= static_cast<int>(cloud->size())) continue;
-                    if (!u.pointAlive(gid)) continue;
-                    const Universe::PointT& pt = (*cloud)[gid];
-                    xyz.push_back({pt.x, pt.y, pt.z});
-                }
-                if (xyz.empty()) continue;
-                updates.push_back(gmd::buildRoomObject(vehicleId, o.id,
-                                                       u.semantics().name(o.class_id), xyz));
-                if (dir) {
-                    auto it = dir->find(o.id);
-                    if (it != dir->end()) updates.back().directionContent = it->second;
-                }
-            }
-            return updates;
-        };
 
-        // Sign-text egress (LIFT3D_USE_SIGN builds only): dispatch detected signs to the async
-        // detector and, at publish time, fold resolved text into directionContent. Off => `dir`
-        // stays null below and nothing sign-related is compiled.
-#ifdef LIFT3D_HAVE_SIGN
-        sign::SignBridge sign_bridge{sign::SignBridge::Config{}};
-        online.setSignHook([&sign_bridge, &online, &p](
-                const SyncedFrame& sf, const FrameResult& fr,
-                const std::vector<int>& pix_gidx, int W, int H, const Universe& u) {
-            sign_bridge.onFrame(sf, fr, pix_gidx, W, H, u, online.inf(), p.voxel);
-        });
-#endif
+        // GMD object egress (EAIRoomObject hull publisher + optional sign text) has moved out
+        // of this runner into gmd_adaptor/gmd_egress.h (gmd::GmdEgress), unwired -- see the
+        // visualizer/logic split. The runner now only feeds the Python visualizer.
 
-        gmd::ObjectDelta delta;  // remembers what was already emitted so we only send the changes
-        online.setObjectsHook([&, vehicle_id](const std::vector<Object>& objs, const Universe& u) {
-            const std::unordered_map<int, std::string>* dir = nullptr;
-#ifdef LIFT3D_HAVE_SIGN
-            std::unordered_map<int, std::string> sign_dir = sign_bridge.annotate(objs, u, p.voxel);
-            dir = &sign_dir;
-#endif
-            std::vector<gmd::EAIRoomObject> all = collectEAIObjects(objs, u, vehicle_id, dir);
-            std::vector<gmd::EAIRoomObject> updates = delta.changedSince(all);  // new or changed only
-            // Hand `updates` to the global object store (same objectId overwrites).
-            for (const gmd::EAIRoomObject& o : updates)
-                std::fprintf(stderr,
-                             "[objects] upsert id=(veh %u) label=%s hull=%zu verts "
-                             "centroid=(%.2f,%.2f) dir=\"%s\"\n",
-                             o.objectId.vehicleId, o.label.c_str(), o.polygon.size(),
-                             o.centroid.x, o.centroid.y, o.directionContent.c_str());
-        });
+        // Visualizer egress: serialize per-frame + final state to the Python viz_server over
+        // ZMQ (msgpack). Inactive (zero overhead) when cfg.viz_endpoint is empty -- the core
+        // build carries no rerun/arrow dependency; all rendering lives in viz_server/.
+        VizPublisher viz(cfg.viz_endpoint);
+
+        // Timeline origin = the first replayed IMAGE timestamp (frames are image-driven), so
+        // the viewer's capture time starts at 0 for the first processed frame.
+        const int start_img = reader.numImages() > 0
+                            ? std::min(p.start, reader.numImages() - 1) : 0;
+        const std::int64_t t0 = reader.numImages() > 0
+                            ? reader.imageTimestamp(std::max(0, start_img)) : 0;
+
+        // Segmentation-overlay egress (viz-only): stash this frame's 2D masks so the frame hook
+        // can forward them to the visualizer, which paints the overlay. Only wired when enabled.
+        const bool seg_on = viz.active() && cfg.seg_overlay != "off";
+        const FrameResult* g_fr = nullptr;
+        if (seg_on)
+            online.setSegHook([&](const SyncedFrame&, const FrameResult& fr) { g_fr = &fr; });
+
+        // Per-frame viz hook: forward the lightweight, time-varying state (pose, camera, image,
+        // seg masks, superpoints on refresh, proposals, objects) to the visualizer. The heavy
+        // full world map is sent once at the end (viz.finish). Only fired when a viz is attached.
+        std::uint64_t last_sp_ver = sp.version();
+        if (viz.active())
+            online.setFrameHook([&](int idx, const SyncedFrame& sf, const PointPixelMap&) {
+                VizFrameFlags flags;
+                flags.superpoints = p.superpoints;
+                flags.proposals   = p.hdbscan;
+                flags.objects     = p.objects;
+                flags.sp_changed  = p.superpoints && sp.version() != last_sp_ver;
+                if (flags.sp_changed) last_sp_ver = sp.version();
+                const double capture_secs = (double)(sf.image_t - t0) * 1e-9;
+                viz.frame(idx, capture_secs, sf, g_fr, sp, os, obj, uni, flags);
+                g_fr = nullptr;   // consume: never repaint stale masks on a no-inference frame
+            });
 
         LogFrameSource src(reader, cam);
         online.attach(src);
         online.begin();
+        viz.begin(uni.semantics(), online.inf().vocab(),
+                  VizSegConfig{cfg.seg_overlay, cfg.seg_alpha, cfg.seg_min_area});
         // p.start/p.count index IMAGES (5 Hz), not scans; each image's body pose is
         // interpolated to its capture time. p.stride sub-samples the image window
         // (every stride-th image is processed; scans stay dense for interpolation).
         src.run(p.start, p.count > 0 ? p.count : -1, p.stride);
         online.finish();
+        viz.finish(uni, obj);   // stream the final full world map (alive points + class/kind)
         const int frames = online.frames();
 
         std::printf("labeled %d frames | world=%d points (%d live, %d tombstoned dynamic) "

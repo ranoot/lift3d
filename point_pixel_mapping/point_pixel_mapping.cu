@@ -39,7 +39,9 @@ __global__ void projectKernel(const float* __restrict__ points_xyz,
                               int N,
                               const float* __restrict__ M, // 12 floats
                               int W, int H,
-                              int r,                        // depth splat radius (px)
+                              int r_max,                    // splat radius / cap (px)
+                              int splat_min,                // lower clamp (depth-scaled)
+                              float k_px,                   // fx*splat_world; 0 => constant r_max
                               int*   __restrict__ out_uv,
                               float* __restrict__ out_depth,
                               int*   __restrict__ zbuffer) // int view, size W*H
@@ -70,6 +72,10 @@ __global__ void projectKernel(const float* __restrict__ points_xyz,
 
     // Splat depth into the (2r+1)^2 window (nearest-wins) so the sparse cloud forms
     // a continuous occluder; per-point (u,v) above stays the exact centre pixel.
+    // Depth-scaled radius (constant r_max in the legacy path, k_px == 0).
+    const int r = k_px > 0.0f
+        ? min(r_max, max(splat_min, (int)lroundf(k_px / c)))
+        : r_max;
     const int cbits = cuda::std::bit_cast<int>(c);
     const int u0 = u - r > 0 ? u - r : 0;
     const int u1 = u + r < W - 1 ? u + r : W - 1;
@@ -129,11 +135,17 @@ int projectPointsToPixels(const float* points_xyz,
                           float*       out_depth,
                           unsigned char* out_visible,
                           int*         out_corr,
-                          int          zbuf_dilate)
+                          int          zbuf_dilate,
+                          int          splat_min,
+                          float        splat_world)
 {
     if (N <= 0) return 0;
     const int W = cam.width, H = cam.height;
-    const int r = zbuf_dilate > 0 ? zbuf_dilate : 0;
+    const int r_max = zbuf_dilate > 0 ? zbuf_dilate : 0;
+    // Perspective-correct splat: k_px = fx * splat_world is one voxel's image
+    // footprint at unit depth; the kernel divides by each point's depth and clamps
+    // to [splat_min, r_max]. splat_world <= 0 => the legacy constant radius r_max.
+    const float k_px = splat_world > 0.0f ? cam.K[0] * splat_world : 0.0f;
     const size_t npix = (size_t)W * H;
 
     float M[12];
@@ -169,7 +181,8 @@ int projectPointsToPixels(const float* points_xyz,
     int threads = 256;
     int blocks  = (N + threads - 1) / threads;
 
-    projectKernel<<<blocks, threads>>>(d_points, N, d_M, W, H, r, d_uv, d_depth, d_zbuf);
+    projectKernel<<<blocks, threads>>>(d_points, N, d_M, W, H, r_max, splat_min, k_px,
+                                       d_uv, d_depth, d_zbuf);
     CUDA_CHECK(cudaGetLastError());
 
     visibilityKernel<<<blocks, threads>>>(N, d_uv, d_depth, d_zbuf, W,

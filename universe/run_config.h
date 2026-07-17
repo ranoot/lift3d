@@ -22,6 +22,10 @@ struct RunConfig {
     float       seg_alpha    = 0.5f;                  // overlay blend strength (0..1)
     int         seg_min_area  = 80;                   // min region px to draw a label box
 
+    // ZMQ endpoint for the Python visualizer (viz_server/). Empty => no viz (headless, zero
+    // overhead). run_semantic_universe connects a PUSH socket here; viz_server binds PULL.
+    std::string viz_endpoint;
+
     semantic::Params p;                               // all pipeline parameters
 };
 

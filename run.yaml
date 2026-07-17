@@ -1,18 +1,34 @@
 # Semantic-Universe pipeline config. Load with:
 #   ./build-cuda/run_semantic_universe --config run.yaml
-#   ./build-cuda/viz_semantic_universe --config run.yaml --spawn
+#   # to visualize, start the Python viz first, then run with --viz:
+#   uv run --project viz_server viz_server/main.py --spawn
+#   ./build-cuda/run_semantic_universe --config run.yaml --viz ipc:///tmp/lift3d_viz.ipc
 # Any key omitted here falls back to its built-in default. CLI overrides:
-#   --log <folder>   --out <file.rrd>   --spawn   (take precedence over this file)
+#   --log <folder>   --out <labeled.pcd>   --viz <zmq-endpoint>   (take precedence)
 
 # ---- recording ----
-log:    ~/dog_logs/20260608_test_log_officePantryNarrowCorridor
+log:    ~/dog_logs/20260608_test_log_signDetection/
 calib:  ""            # empty => <log>/../CameraCalRaiboAsQUGV113.xml
 cam:    211
 out:    recordings/sem_universe_with_3tier_tuning.rrd
 
+# ZMQ endpoint the runner PUSHes viz messages to (the Python viz_server binds PULL here).
+# Empty => headless, no visualizer (zero overhead). Overridden by --viz.
+viz_endpoint: ""     # e.g. ipc:///tmp/lift3d_viz.ipc
+
+# ---- viz overlay (forwarded to the Python viz_server) ----
+# The per-frame DVIS 2D segmentation is painted onto the camera image by the visualizer, so
+# the raw 2D masks are legible in the rerun 2D view. Color-coded fill + per-object text
+# labels, logged under world/camera/seg_by_class and world/camera/seg_by_instance (toggle
+# each in the entity tree). The raw frame at world/camera/image is left untouched.
+viz:
+  seg_overlay:  instance    # off | class | instance | both (which colored overlays to log)
+  seg_alpha:    0.3     # blend strength of the color fill over the RGB (0..1)
+  seg_min_area: 10      # min region size in px before a segment gets a labelled box
+
 # ---- accumulation window ----
 start:  0
-count:  1000
+count:  1500
 stride: 2
 
 # ---- map + projection ----
@@ -20,8 +36,17 @@ voxel:  0.05          # world voxel fusion size (m)
 radius: 6             # fallback for proj_radius when that is unset (m); 0 => whole map
 proj_radius: 7.5      # z-buffer CANDIDATE cull radius (m) -- a projection optimization so we
                       # don't project the whole map; NOT a processing window. 0 => use radius
-tau:    0.17         # z-buffer visibility tolerance (m)
-splat:  2            # z-buffer depth dilation radius (px)
+tau:    0.15         # z-buffer visibility tolerance (m)
+# Depth-scaled (perspective-correct) splat. A sparse voxel cloud leaves image holes
+# whose size scales with 1/depth, so a single constant radius under-fills near
+# surfaces (occluded points leak the foreground label) or over-halos far ones
+# (visible surfaces self-occlude). With splat_mult > 0 the radius is sized to one
+# voxel's image footprint per point: r(c) = clamp(round(fx*voxel*splat_mult/c),
+# splat_min, splat). `splat` is then the near-field CAP (r_max); splat_mult: 0
+# disables => constant radius `splat` (legacy).
+splat:  15           # near-field cap r_max (px); constant radius when splat_mult == 0
+splat_mult: 1.2      # overlap factor on the voxel footprint; 0 => legacy constant splat
+splat_min:  3        # far-field floor on the depth-scaled radius (px)
 surf_band: 0.75      # working-set front-surface band (m): at each pixel keep every visible
                      # point within this depth of the nearest. 0 => one point/pixel (sparse);
                      # 0.1 keeps the full front surface -> more geometry for clustering
@@ -42,12 +67,12 @@ things_only: false    # if true, only stamp object (thing) classes
 voting:
   enabled:    true   # false => per-frame transient labels (previous behaviour)
   stuff_bias: 2.0     # weight on stuff votes in the argmax (1 => symmetric, no bias)
-  min_votes:  2       # min total votes before a class resolves (1 => off)
-  min_conf:   0.0     # min winning fraction of raw votes (0 => off)
+  min_votes:  3       # min total votes before a class resolves (1 => off)
+  min_conf:   0.2     # min winning fraction of raw votes (0 => off)
 
 # ---- inference server + vocabulary ----
 endpoint: ipc:///tmp/inf_server.ipc
-thing: [door, chair, table, person, trash can, box, monitor, shelf, window, monitor, lockers, meeting pod, whiteboard, sign, fridge, extinguisher]
+thing: [door, chair, table, person, trash can, monitor, shelf, window, monitor, lockers, meeting pod, whiteboard, sign, fridge, extinguisher]
 stuff: [wall, floor, ceiling]
 # Dynamic-object classes: their points are DROPPED at ingest (never fused into the map),
 # so moving objects leave no smear. Keep them in `thing`/`stuff` above so the 2D model
@@ -60,7 +85,7 @@ dynamic: [person]
 # the semantics for growing.
 superpoints:
   enabled:    true
-  seed:       0.25     # VCCS seed resolution (m); larger => fewer/larger superpoints
+  seed:       0.35     # VCCS seed resolution (m); larger => fewer/larger superpoints
   thing_frac: 0.001     # min fraction of ALL member points (incl. stuff/unlabeled) that
                        # must carry the winning thing class for the superpoint to take it
   spatial:    0.9      # VCCS spatial importance
@@ -83,7 +108,7 @@ hdbscan:
                               # vs a scan per class; false => per-class fallback
   sor_enabled:          true   # Statistical Outlier Removal before HDBSCAN: drop sparse
                               # points so thin noise bridges can't fuse distinct objects
-  sor_mean_k:           12     # neighbors per point for the density estimate
+  sor_mean_k:           24     # neighbors per point for the density estimate
   sor_std_mul:          0.5    # smaller => more aggressive pruning (keeps only denser points)
   use_instance_ids:     false   # INSTANCE-GUIDED seeding: group thing points by (class,
                               # resolved DVIS instance) and seed each group WHOLE, bypassing
@@ -101,10 +126,10 @@ hdbscan:
 # threshold is effectively a containment floor -- start ~0.4-0.5 and tune.
 grow:
   enabled:        true
-  affinity:       0.10   # merge threshold on cosine(hist) * containment
+  affinity:       0.30   # merge threshold on cosine(hist) * containment
   require_class:  true   # only merge a superpoint into a proposal of the same thing class
   # SAI3D neighborhood-aware growing (opt-in; defaults reproduce the legacy single greedy pass)
-  neighbor_pool:  true  # pool each superpoint's histogram over its KNN neighbors before cosine
+  neighbor_pool:  false  # pool each superpoint's histogram over its KNN neighbors before cosine
   sweeps:         3      # assignment sweeps (>1 revisits superpoints as objects grow)
   dis_decay:      0.2    # decay weight applied to neighbor histograms when pooling
   pool_k:         4      # KNN count over superpoint centroids for pooling
@@ -118,8 +143,8 @@ grow:
 # pipeline's primary output. Progressive merging (SGS-3D / SAI3D), not a one-shot promotion.
 objects:
   enabled:       true
-  merge_thresh:  [0.55, 0.45, 0.35, 0.30, 0.30, 0.30, 0.25, 0.25, 0.25, 0.25, 0.15]  # union bar by component level (level 1 strictest .. top loosest)
-  min_merges:    21       # merged observations a component needs before it is a reported object
+  merge_thresh:  [0.55, 0.45, 0.35, 0.30, 0.30, 0.25, 0.25, 0.25, 0.25, 0.25, 0.20]  # union bar by component level (level 1 strictest .. top loosest)
+  min_merges:    15       # merged observations a component needs before it is a reported object
   require_class: true   # only union seeds of the same thing class
   consol_stride: 1       # fold proposals only every Nth frame (skip near-duplicate adjacent views); 1 = every frame
   # ---- SAI3D global-context merging (opt-in; global_context=false => legacy single-frame path) ----
@@ -129,8 +154,8 @@ objects:
   # accumulated affinity clears the level bar with enough evidence AND a neighborhood-aggregated
   # score agrees (SAI3D judge_connect). Kills single-frame spurious bridges.
   global_context:        true  # master switch for the accumulated-affinity merge path
-  min_evidence:          2.2    # min accumulated confidence before any inter-object merge
-  dis_decay:             0.5    # neighborhood-aggregation decay (judge_connect)
+  min_evidence:          2.8    # min accumulated confidence before any inter-object merge
+  dis_decay:             0.3    # neighborhood-aggregation decay (judge_connect)
   use_semantic_affinity: true   # include cosine(class histogram) in the per-frame deposit
   use_containment:       true   # multiply each deposit by voxel containment (shared/min(|P|,|comp|))
                                 # so a grazing overlap accrues weak evidence -- curbs over-merging

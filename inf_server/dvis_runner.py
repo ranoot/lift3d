@@ -97,6 +97,7 @@ class DvisRunner:
         overlap_thresh: float = 0.8,
         ensemble_alpha: float = 0.4,
         ensemble_beta: float = 0.8,
+        synonyms: dict[str, list[str]] | None = None,
     ):
         self.weights_path = weights_path
         self.device = device
@@ -105,6 +106,9 @@ class DvisRunner:
         self.overlap_thresh = overlap_thresh
         self.ensemble_alpha = ensemble_alpha
         self.ensemble_beta = ensemble_beta
+        # canonical class name -> extra synonym phrases; expanded into the model-side
+        # comma string in set_vocab (see _expand). Never leaves Python.
+        self.synonyms = synonyms or {}
 
         cfg = get_cfg()
         add_deeplab_config(cfg)
@@ -130,6 +134,24 @@ class DvisRunner:
         self.keep = False  # tracker resume flag (False => next frame starts a video)
 
     # ------------------------------------------------------------------ vocab
+    def _expand(self, name: str) -> str:
+        """Canonical class name -> comma-joined "canonical,syn1,syn2" prompt string.
+
+        The model (prepare_class_names_from_metadata) splits on commas and max-ensembles
+        over the synonyms, so more phrasings only raise recall. Returns ``name`` unchanged
+        when the class has no synonyms. The canonical name stays first and is de-duplicated
+        if a caller lists it among its own synonyms.
+        """
+        syns = self.synonyms.get(name)
+        if not syns:
+            return name
+        out = [name]
+        for s in syns:
+            s = s.strip()
+            if s and s not in out:
+                out.append(s)
+        return ",".join(out)
+
     def set_vocab(self, thing_classes: list[str], stuff_classes: list[str]) -> int:
         """Register the vocabulary, (build &) load the model, compute classifier.
 
@@ -137,11 +159,14 @@ class DvisRunner:
         is set-once per key; the model is built only on the first call and reused
         via ``set_metadata`` afterwards.
         """
-        thing = sorted(thing_classes)
+        thing = sorted(thing_classes)  # sort by canonical name (must match the C++ vocab)
         stuff = sorted(stuff_classes)
-        classes_ov = thing + stuff
-        if not classes_ov:
+        if not thing and not stuff:
             raise ValueError("vocabulary is empty")
+        # Enrich each slot with synonyms AFTER sorting, so the label-id order stays keyed on
+        # the canonical name (only the string content of each class grows). The model splits
+        # these comma strings itself (prepare_class_names_from_metadata); C++ never sees them.
+        classes_ov = [self._expand(c) for c in thing] + [self._expand(c) for c in stuff]
 
         name = f"inf_vocab_{self._vocab_seq}"
         self._vocab_seq += 1

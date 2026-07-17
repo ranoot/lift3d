@@ -22,9 +22,9 @@ DEFAULT_ENDPOINT = "ipc:///tmp/inf_server.ipc"
 # The runner resolves each frame with VPS panoptic assignment on top of the
 # FC-CLIP geometric ensemble (see dvis_runner.py). These are the levers for
 # recall of open-vocabulary / novel classes (signs, fire extinguishers, ...).
-OBJECT_MASK_THRESH = 0.08  # VPS keep gate: drop queries whose winning class score <= this
+OBJECT_MASK_THRESH = 0.10  # VPS keep gate: drop queries whose winning class score <= this
 OVERLAP_THRESH = 0.7      # per-segment stability: min (kept / original) mask-area ratio
-ENSEMBLE_ALPHA = 0.3      # geometric-ensemble weight for SEEN (in-train) classes
+ENSEMBLE_ALPHA = 0.5      # geometric-ensemble weight for SEEN (in-train) classes
 ENSEMBLE_BETA = 1.3       # geometric-ensemble weight for UNSEEN classes; raise toward 1.0
                           # to trust CLIP more for novel classes (sign, extinguisher, ...)
 

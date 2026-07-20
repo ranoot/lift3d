@@ -9,3 +9,6 @@ export/wheelhouse/
 
 # Virtual environments
 .venv
+
+# Bundled offline runtime assets (HF CLIP cache, ~1.4G) — ships in the handoff zip, never in git
+assets/

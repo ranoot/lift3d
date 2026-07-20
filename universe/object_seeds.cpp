@@ -10,6 +10,7 @@
 
 #include <pcl/filters/statistical_outlier_removal.h>   // SOR pre-filter before HDBSCAN
 #include <pcl/search/kdtree.h>                          // radius search for Euclidean split
+#include <pcl/common/point_tests.h>                     // pcl::isFinite (drop NaN/Inf before kd-tree)
 #include <functional>
 
 #include <algorithm>
@@ -176,7 +177,9 @@ void ObjectSeeds::seedLocal(const Universe& uni, const Params& p,
         if (!uni.pointIsThing(i) || claimed(i)) continue;
         const int cid = uni.pointClassId(i);
         if (cid < 0) continue;
-        auto it = cell_count.find(objutil::voxelOf((*cloud)[i], cinv));
+        const Universe::PointT& pt = (*cloud)[i];
+        if (!pcl::isFinite(pt)) continue;               // NaN/Inf -> parlay kd-tree stack overflow
+        auto it = cell_count.find(objutil::voxelOf(pt, cinv));
         if (it == cell_count.end() || it->second < mat_min) continue;   // immature cell
         by_class[cid].push_back(i);
     }
@@ -260,6 +263,7 @@ void ObjectSeeds::seedFromIndices(const Universe& uni, const std::vector<int>& g
     std::map<int, std::vector<int>> by_class;
     for (int g : gidx) {
         if (g < 0 || g >= (int)cloud->size()) continue;
+        if (!pcl::isFinite((*cloud)[g])) continue;      // NaN/Inf -> parlay kd-tree stack overflow
         if (!p.overlap_sets && claimed(g)) continue;
         const int cid = uni.pointClassId(g);
         if (cid < 0 || uni.pointClassKind(g) != ClassKind::Thing) continue;

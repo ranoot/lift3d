@@ -19,6 +19,8 @@ arrays rebuild without a python-list round trip. Message catalogue (keyed by ``t
                     "superpoints": [entity+kind, ...]}   # optional, only on VCCS refresh
       entity = {"id": int, "class_id": int, "name": str,
                 "centroid": <f4 (3,)>, "points": <f4 (M,3)>}   # (+ "kind": int for superpoints)
+      objects may also carry "text": str -- free text attached to that object (today the
+      sign-understanding result), drawn as a label at its centroid.
 
   {"type": "finish", "positions": <f4 (N,3)>, "class_ids": <i2 (N,)>, "kinds": <i1 (N,)>}
 """

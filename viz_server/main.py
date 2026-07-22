@@ -99,6 +99,9 @@ class Viz:
         self.seed_col: list[np.ndarray] = []
         self.seed_lbl: list[str] = []
         self.seed_running = 0
+        # Sign text per object id (from the sign-understanding egress): kept so a resolved sign
+        # stays visible, and so the text log only fires when an object's text actually changes.
+        self.obj_text: dict[int, str] = {}
 
     # ---- begin -------------------------------------------------------------
     def on_begin(self, msg: dict) -> None:
@@ -241,7 +244,8 @@ class Viz:
                 mcol.append(np.tile(col, (pts.shape[0], 1)))
             ctr.append(np.asarray(e["centroid"], dtype=np.float32).reshape(3))
             ccol.append(col)
-            clbl.append(e.get("name", ""))
+            name, text = e.get("name", ""), e.get("text", "")
+            clbl.append(f"{name} | {text}" if text else name)
         mpos = np.concatenate(mpos) if mpos else np.zeros((0, 3), np.float32)
         mcol = np.concatenate(mcol) if mcol else np.zeros((0, 3), np.uint8)
         ctr = np.array(ctr, dtype=np.float32).reshape(-1, 3)
@@ -255,6 +259,30 @@ class Viz:
                rr.Points3D(mpos, colors=mcol, radii=0.045, show_labels=False), static=static)
         rr.log("world/objects/centroids",
                rr.Points3D(ctr, colors=ccol, labels=clbl, radii=0.15), static=static)
+        self._log_object_text(objects, static)
+
+    def _log_object_text(self, objects, static: bool) -> None:
+        """Objects carrying free text (today the sign-understanding result) get an
+        always-labelled red marker at their centroid under world/objects/sign_text, plus a line
+        in the `sign` text stream the first time that text appears. Sign text is sticky, so a
+        frame without any text leaves the previous markers standing."""
+        pos, labels = [], []
+        for o in objects:
+            text = o.get("text", "")
+            if not text:
+                continue
+            oid, name = int(o["id"]), o.get("name", "")
+            pos.append(np.asarray(o["centroid"], dtype=np.float32).reshape(3))
+            labels.append(f"{name}: {text}")
+            if self.obj_text.get(oid) != text:
+                self.obj_text[oid] = text
+                rr.log("sign", rr.TextLog(f"object {oid} ({name}) -> {text}", level="INFO"))
+        if not pos:
+            return
+        rr.log("world/objects/sign_text",
+               rr.Points3D(np.array(pos, dtype=np.float32).reshape(-1, 3),
+                           colors=np.tile(np.array([255, 64, 64], np.uint8), (len(pos), 1)),
+                           labels=labels, radii=0.25, show_labels=True), static=static)
 
     def _log_proposals(self, proposals) -> None:
         mpos, mcol, ctr, ccol, clbl = self._concat_points(
@@ -338,7 +366,8 @@ class Viz:
         n = int(pos.shape[0])
         print(f"[viz] finish: world={n} alive points "
               f"({int(thing.sum())} thing, {int(stuff.sum())} stuff, {int(other.sum())} other) "
-              f"| {len(self.last_objects)} objects | {len(self.seed_ctr)} proposal centroids",
+              f"| {len(self.last_objects)} objects | {len(self.seed_ctr)} proposal centroids"
+              f"{f' | {len(self.obj_text)} with sign text' if self.obj_text else ''}",
               flush=True)
 
 

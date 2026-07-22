@@ -27,6 +27,7 @@
 #include "dog_stream.h"          // SyncedFrame
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Viz-only 2D segmentation overlay config, forwarded to Python in the begin message so it
@@ -70,11 +71,14 @@ public:
     // One frame's lightweight, time-varying state. `seg` (nullable) carries this frame's 2D
     // masks for the painted overlay; `sp`/`os`/`obj`/`uni` are read live (member points are
     // gathered from the Universe cloud, alive-filtered exactly as the old viz did). `flags`
-    // selects which discovery tiers to include.
+    // selects which discovery tiers to include. `obj_text` (nullable) maps object id -> free
+    // text -- today the sign-understanding result (sign_adaptor/) -- which the viewer draws as a
+    // label on that object; objects absent from the map carry no text.
     void frame(int idx, double capture_secs, const SyncedFrame& sf,
                const FrameResult* seg,
                const Superpoints& sp, const ObjectSeeds& os, const Objects& obj,
-               const Universe& uni, const VizFrameFlags& flags);
+               const Universe& uni, const VizFrameFlags& flags,
+               const std::unordered_map<int, std::string>* obj_text = nullptr);
 
     // Final world snapshot: every ALIVE point (position + class id + thing/stuff kind) plus
     // the final object list. Sent best-effort at end of run so the viewer can log the static

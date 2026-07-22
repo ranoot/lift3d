@@ -26,6 +26,26 @@ viz:
   seg_alpha:    0.3     # blend strength of the color fill over the RGB (0..1)
   seg_min_area: 10      # min region size in px before a segment gets a labelled box
 
+# ---- sign-text egress (sign_adaptor/) ----
+# When enabled, the largest sign-class instance mask of a frame is sent to the sign-
+# understanding module (bbox + timestamp + a match id) IF nothing is already being read --
+# reading takes ~1-2s and frames arriving meanwhile are dropped on purpose. The returned
+# text is attached to the object whose 3D footprint contains the sign (biggest proposal wins
+# on conflict): it fills EAIRoomObject::directionContent and is drawn on the object in rerun.
+# Progress is logged to stderr as [sign] DETECTED / SENT / RECEIVED / ATTACHED.
+# `classes` must also appear in `thing:` below, or the 2D model never segments a sign.
+# The real VLM backend needs a -DLIFT3D_USE_SIGN=ON build; otherwise a mock backend answers
+# mock_text after mock_delay_ms, which is the way to exercise this end to end without it.
+sign:
+  enabled: false          # master switch (nothing is constructed when false)
+  classes: [sign]         # vocab names treated as signs
+  min_px:  60             # ignore sign masks smaller than this (px)
+  vlm_url: "http://localhost:8080/v1"
+  workers: 1
+  queue:   4
+  mock_delay_ms: 1500     # mock backend only: stand-in for the VLM round trip
+  mock_text: "MOCK: toilet -> left; exit -> right"
+
 # ---- accumulation window ----
 start:  0
 count:  2000

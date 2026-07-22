@@ -48,6 +48,20 @@ RunConfig loadRunConfig(const std::string& path) {
     cfg.viz_endpoint = root["viz_endpoint"].as<std::string>(
                            viz["endpoint"].as<std::string>(cfg.viz_endpoint));
 
+    // sign: { enabled, vlm_url, classes, min_px, workers, queue, mock_delay_ms, mock_text }
+    // Sign-text egress. OFF unless explicitly enabled; the mock_* keys only bite in a build
+    // without LIFT3D_USE_SIGN (where the stand-in backend replies instead of the VLM).
+    YAML::Node sg = root["sign"];
+    sign::SignConfig sd;                              // built-in defaults
+    cfg.sign_cfg.enabled       = sg["enabled"].as<bool>(sd.enabled);
+    cfg.sign_cfg.vlm_url       = sg["vlm_url"].as<std::string>(sd.vlm_url);
+    cfg.sign_cfg.sign_classes  = sg["classes"].as<std::vector<std::string>>(sd.sign_classes);
+    cfg.sign_cfg.num_workers   = sg["workers"].as<int>(sd.num_workers);
+    cfg.sign_cfg.queue_size    = sg["queue"].as<int>(sd.queue_size);
+    cfg.sign_cfg.min_sign_px   = sg["min_px"].as<int>(sd.min_sign_px);
+    cfg.sign_cfg.mock_delay_ms = sg["mock_delay_ms"].as<int>(sd.mock_delay_ms);
+    cfg.sign_cfg.mock_text     = sg["mock_text"].as<std::string>(sd.mock_text);
+
     semantic::Params& p = cfg.p;
     p.start      = root["start"].as<int>(d.start);
     p.count      = root["count"].as<int>(d.count);

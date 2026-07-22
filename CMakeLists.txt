@@ -224,10 +224,17 @@ add_executable(object_publisher_check tests/object_publisher_check.cpp)
 target_link_libraries(object_publisher_check gmd_adaptor gmd_types)
 
 # ---------------------------------------------------------------------------------------
-# Sign-text egress (LIFT3D_USE_SIGN). Additive + optional: compiles the teammate's
-# SignUnderstanding detector chain (sign-unds/) plus our sign_adaptor bridge, and folds
-# resolved sign text into semantic_runner's EAIRoomObject::directionContent. Nothing above is
-# touched when the option is OFF.
+# Sign-text egress. The BRIDGE (sign_adaptor/sign_bridge.cpp -- mask scan, single-in-flight
+# gate, 3D footprint, object matching, logging) is always built: it needs nothing beyond
+# `universe`. Only the DETECTOR BACKEND is optional:
+#
+#   LIFT3D_USE_SIGN=OFF (default) -> sign_detector_mock.cpp: sleeps, then answers with a canned
+#                                    text. No OpenCV/CURL/VLM. Lets the whole path (logs,
+#                                    directionContent, rerun labels) be exercised anywhere.
+#   LIFT3D_USE_SIGN=ON            -> sign_detector_real.cpp + the teammate's SignUnderstanding
+#                                    detector chain (sign-unds/) talking to the real VLM.
+#
+# Either way nothing runs unless run.yaml sets `sign: {enabled: true}`.
 # ---------------------------------------------------------------------------------------
 if(LIFT3D_USE_SIGN)
   find_package(CURL REQUIRED)
@@ -247,25 +254,38 @@ if(LIFT3D_USE_SIGN)
   set(SIGN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/sign-unds)
   # NOTE: GmdTimeStubs.cpp is intentionally excluded -- its Common::Time symbols are already
   # defined by gmd_types (real TimeStamp.cpp), so compiling it here would duplicate them.
-  add_library(sign_adaptor STATIC
-    sign_adaptor/sign_bridge.cpp
+  set(SIGN_BACKEND_SRC
+    sign_adaptor/sign_detector_real.cpp
     ${SIGN_SRC}/src/ConcurrentDetectorWrapper.cpp
     ${SIGN_SRC}/src/DetectorWrapper.cpp
     ${SIGN_SRC}/src/VlmClient.cpp
     ${SIGN_SRC}/src/CroppingEngine.cpp
     ${SIGN_SRC}/src/ResponseProcessor.cpp)
-  target_include_directories(sign_adaptor PUBLIC
-    sign_adaptor ${SIGN_SRC}/include gmdDataTypesForInterns2)
-  target_link_libraries(sign_adaptor
-    PUBLIC  universe dog_log_adaptor gmd_types
-    PRIVATE CURL::libcurl ${OpenCV_LIBS} nlohmann_json::nlohmann_json
-            ${JPEG_LIBRARIES} ${PNG_LIBRARIES} Eigen3::Eigen Threads::Threads)
-  set_target_properties(sign_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-  # Turn on the #ifdef'd sign wiring in the SemanticRunner and link the detector in. PUBLIC so
-  # the LIFT3D_HAVE_SIGN define (which changes the Impl's layout -- adds the SignBridge member)
-  # is seen identically by every TU that links semantic_runner.
-  target_compile_definitions(semantic_runner PUBLIC LIFT3D_HAVE_SIGN)
-  target_link_libraries(semantic_runner PUBLIC sign_adaptor)
-  message(STATUS "LIFT3D_USE_SIGN: sign-text egress enabled (via semantic_runner)")
+else()
+  set(SIGN_BACKEND_SRC sign_adaptor/sign_detector_mock.cpp)
 endif()
+
+add_library(sign_adaptor STATIC sign_adaptor/sign_bridge.cpp ${SIGN_BACKEND_SRC})
+target_include_directories(sign_adaptor PUBLIC sign_adaptor)
+target_link_libraries(sign_adaptor
+  PUBLIC  universe dog_log_adaptor
+  PRIVATE Threads::Threads)
+set_target_properties(sign_adaptor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(LIFT3D_USE_SIGN)
+  # Only the real backend TU (+ the vendored detector chain) sees the teammate's / GMD headers.
+  target_include_directories(sign_adaptor PRIVATE ${SIGN_SRC}/include gmdDataTypesForInterns2)
+  target_link_libraries(sign_adaptor
+    PRIVATE gmd_types CURL::libcurl ${OpenCV_LIBS} nlohmann_json::nlohmann_json
+            ${JPEG_LIBRARIES} ${PNG_LIBRARIES} Eigen3::Eigen)
+  target_compile_definitions(sign_adaptor PUBLIC LIFT3D_HAVE_SIGN)
+  message(STATUS "LIFT3D_USE_SIGN: sign detector backend = sign-unds (real VLM)")
+else()
+  message(STATUS "sign detector backend = mock (build with -DLIFT3D_USE_SIGN=ON for the VLM)")
+endif()
+
+# Both drivers carry the bridge; it stays dormant unless run.yaml sets sign.enabled.
+target_link_libraries(run_semantic_universe sign_adaptor)
+target_link_libraries(semantic_runner PUBLIC sign_adaptor)
+# run_config.h carries the `sign:` block (sign_adaptor/sign_config.h -- header only, no link).
+target_include_directories(run_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/sign_adaptor)

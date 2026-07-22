@@ -11,13 +11,12 @@
 #include "gmd_frame_source.h"    // gmd::toNanoseconds / toPose6 / toPackedCloud / toDogImage
 #include "object_publisher.h"    // gmd::buildRoomObject, EAIRoomObject
 
-#ifdef LIFT3D_HAVE_SIGN
-#include "sign_bridge.h"         // sign::SignBridge (LIFT3D_USE_SIGN builds only)
-#endif
+#include "sign_bridge.h"         // sign::SignBridge (sign-text egress; run.yaml sign.enabled)
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -52,9 +51,11 @@ struct SemanticRunner::Impl {
     bool                       seg_on      = false;
 
     std::unordered_map<int, CacheEntry> cache;   // object id -> cached hull
-#ifdef LIFT3D_HAVE_SIGN
-    std::unique_ptr<sign::SignBridge>   sign;
-#endif
+
+    // Sign-text egress (null unless run.yaml enables it). `sign_text` is the last annotation,
+    // reused by the viz hook so the viewer draws the same text the egress publishes.
+    std::unique_ptr<sign::SignBridge>    sign;
+    std::unordered_map<int, std::string> sign_text;
 
     explicit Impl(const std::string& config_path)
         : cfg(loadRunConfig(config_path)),
@@ -103,10 +104,7 @@ SemanticRunner::Impl::collect(const std::vector<Object>& objs, const Universe& u
     Universe::Cloud::ConstPtr cloud = uni.cloud();
     if (!cloud) return out;
 
-#ifdef LIFT3D_HAVE_SIGN
-    std::unordered_map<int, std::string> sign_dir =
-        sign ? sign->annotate(objs, uni, voxel) : std::unordered_map<int, std::string>{};
-#endif
+    if (sign) sign_text = sign->annotate(objs, uni, voxel);   // object id -> resolved sign text
 
     std::unordered_set<int>           present;
     std::vector<std::array<float, 3>> xyz;
@@ -131,10 +129,10 @@ SemanticRunner::Impl::collect(const std::vector<Object>& objs, const Universe& u
                                        uni.semantics().name(o.class_id), xyz);
             cache[o.id] = CacheEntry{sig, obj};
         }
-#ifdef LIFT3D_HAVE_SIGN
-        auto sit = sign_dir.find(o.id);                      // signs can change without geometry
-        obj.directionContent = (sit != sign_dir.end()) ? sit->second : std::string{};
-#endif
+        if (sign) {                                          // signs change without geometry
+            auto sit = sign_text.find(o.id);
+            obj.directionContent = (sit != sign_text.end()) ? sit->second : std::string{};
+        }
         present.insert(o.id);
         out.push_back(std::move(obj));
     }
@@ -176,17 +174,21 @@ SemanticRunner::SemanticRunner(const std::string& config_path)
             const double capture_secs =
                 d->have_t0 ? static_cast<double>(sf.image_t - d->t0) * 1e-9 : 0.0;
             d->viz.frame(idx, capture_secs, sf, d->g_fr, d->online.superpoints(),
-                         d->online.seeds(), d->online.objects(), d->online.universe(), flags);
+                         d->online.seeds(), d->online.objects(), d->online.universe(), flags,
+                         d->sign_text.empty() ? nullptr : &d->sign_text);
             d->g_fr = nullptr;   // consume: never repaint stale masks on a no-inference frame
         });
 
-#ifdef LIFT3D_HAVE_SIGN
-    d->sign = std::make_unique<sign::SignBridge>(sign::SignBridge::Config{});
-    d->online.setSignHook([d](const SyncedFrame& sf, const FrameResult& fr,
-                              const std::vector<int>& pix_gidx, int W, int H, const Universe& u) {
-        d->sign->onFrame(sf, fr, pix_gidx, W, H, u, d->online.inf(), d->voxel);
-    });
-#endif
+    // Sign-text egress: only wired when run.yaml enables it (`sign: {enabled: true}`), so the
+    // default deployment path is unchanged. Fills EAIRoomObject::directionContent.
+    if (d->cfg.sign_cfg.enabled) {
+        d->sign = std::make_unique<sign::SignBridge>(d->cfg.sign_cfg);
+        d->online.setSignHook([d](const SyncedFrame& sf, const FrameResult& fr,
+                                  const std::vector<int>& pix_gidx, int W, int H,
+                                  const Universe& u) {
+            d->sign->onFrame(sf, fr, pix_gidx, W, H, u, d->online.inf(), d->voxel);
+        });
+    }
 
     d->online.begin();
     if (d->viz.active())
@@ -261,8 +263,8 @@ SemanticRunner::runOnInput(std::optional<OpenVocabSegInput> input) {
     std::vector<Common::Entity::EAIRoomObject> objects =
         d->collect(d->online.objects().list(), d->online.universe());
 
-    std::printf("[semantic_runner] frame %d -> %zu objects\n",
-                d->online.frames(), objects.size());
+    std::printf("[semantic_runner] frame %d -> %zu objects (%zu with sign text)\n",
+                d->online.frames(), objects.size(), d->sign_text.size());
     std::fflush(stdout);
     return objects;
 }

@@ -106,7 +106,8 @@ void VizPublisher::begin(const SemanticVocabulary& sem,
 void VizPublisher::frame(int idx, double capture_secs, const SyncedFrame& sf,
                          const FrameResult* seg,
                          const Superpoints& sp, const ObjectSeeds& os, const Objects& obj,
-                         const Universe& uni, const VizFrameFlags& flags) {
+                         const Universe& uni, const VizFrameFlags& flags,
+                         const std::unordered_map<int, std::string>* obj_text) {
     if (!active_) return;
     Universe::Cloud::ConstPtr cloud = uni.cloud();
 
@@ -116,15 +117,16 @@ void VizPublisher::frame(int idx, double capture_secs, const SyncedFrame& sf,
     const bool has_prop  = flags.proposals;
     const bool has_sp    = flags.superpoints && flags.sp_changed;
 
-    // One map per discovered entity {id,class_id,name,centroid,points(+kind)}.
+    // One map per discovered entity {id,class_id,name,centroid,points(+kind)(+text)}.
     auto packEntity = [&](mpk::Packer& p, int id, int class_id,
                           const float centroid[3], const std::vector<int>& pts,
-                          const int* kind) {
-        p.mapHeader(kind ? 6 : 5);
+                          const int* kind, const std::string* text = nullptr) {
+        p.mapHeader(5 + (kind ? 1 : 0) + (text ? 1 : 0));
         p.str("id");       p.integer(id);
         p.str("class_id"); p.integer(class_id);
         p.str("name");     p.str(uni.semantics().name(class_id));
         if (kind) { p.str("kind"); p.integer(*kind); }
+        if (text) { p.str("text"); p.str(*text); }
         p.str("centroid"); packNdarray(p, "<f4", {3}, centroid, 3 * sizeof(float));
         std::vector<float> xyz = gatherXYZ(uni, cloud, pts);
         p.str("points");   packF32(p, xyz, (uint32_t)(xyz.size() / 3), 3);
@@ -175,8 +177,14 @@ void VizPublisher::frame(int idx, double capture_secs, const SyncedFrame& sf,
     if (has_obj) {
         p.str("objects");
         p.arrHeader((uint32_t)obj.list().size());
-        for (const Object& o : obj.list())
-            packEntity(p, o.id, o.class_id, o.centroid, o.points, nullptr);
+        for (const Object& o : obj.list()) {
+            const std::string* text = nullptr;      // e.g. this object's resolved sign text
+            if (obj_text) {
+                auto it = obj_text->find(o.id);
+                if (it != obj_text->end() && !it->second.empty()) text = &it->second;
+            }
+            packEntity(p, o.id, o.class_id, o.centroid, o.points, nullptr, text);
+        }
     }
     if (has_prop) {
         p.str("proposals");

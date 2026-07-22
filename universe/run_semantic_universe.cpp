@@ -24,6 +24,7 @@
 #include "semantic_pipeline.h"
 #include "online_semantic.h"
 #include "viz_publisher.h"      // VizPublisher: stream per-frame + final state to the Python viz
+#include "sign_bridge.h"        // sign::SignBridge: sign-text egress (run.yaml sign.enabled)
 
 #include <pcl/io/pcd_io.h>
 
@@ -114,9 +115,23 @@ int main(int argc, char** argv) {
         ObjectSeeds& os  = online.seeds();
         Objects&     obj = online.objects();
 
-        // GMD object egress (EAIRoomObject hull publisher + optional sign text) lives in the
-        // simplified all-in-one entry point universe/semantic_runner.h (semantic::SemanticRunner,
-        // runOnInput); this runner only feeds the Python visualizer.
+        // GMD object egress (EAIRoomObject hull publisher) lives in the simplified all-in-one
+        // entry point universe/semantic_runner.h (semantic::SemanticRunner, runOnInput); this
+        // runner only feeds the Python visualizer.
+
+        // Sign-text egress (run.yaml `sign: {enabled: true}`): forward sign-class instance masks
+        // to the sign-understanding module and attach the returned text to the object containing
+        // the sign. Every stage logs to stderr with a [sign] prefix. Not constructed at all when
+        // disabled, so a normal run is untouched.
+        std::unique_ptr<sign::SignBridge> sign_bridge;
+        if (cfg.sign_cfg.enabled) {
+            sign_bridge = std::make_unique<sign::SignBridge>(cfg.sign_cfg);
+            online.setSignHook([&](const SyncedFrame& sf, const FrameResult& fr,
+                                   const std::vector<int>& pix_gidx, int W, int H,
+                                   const Universe& u) {
+                sign_bridge->onFrame(sf, fr, pix_gidx, W, H, u, online.inf(), p.voxel);
+            });
+        }
 
         // Visualizer egress: serialize per-frame + final state to the Python viz_server over
         // ZMQ (msgpack). Inactive (zero overhead) when cfg.viz_endpoint is empty -- the core
@@ -150,7 +165,13 @@ int main(int argc, char** argv) {
                 flags.sp_changed  = p.superpoints && sp.version() != last_sp_ver;
                 if (flags.sp_changed) last_sp_ver = sp.version();
                 const double capture_secs = (double)(sf.image_t - t0) * 1e-9;
-                viz.frame(idx, capture_secs, sf, g_fr, sp, os, obj, uni, flags);
+                // Resolved sign text per object, so the viewer can label the sign's object.
+                // Returns an empty map (and costs nothing) until a sign is actually read.
+                std::unordered_map<int, std::string> sign_text;
+                if (sign_bridge && p.objects)
+                    sign_text = sign_bridge->annotate(obj.list(), uni, p.voxel);
+                viz.frame(idx, capture_secs, sf, g_fr, sp, os, obj, uni, flags,
+                          sign_text.empty() ? nullptr : &sign_text);
                 g_fr = nullptr;   // consume: never repaint stale masks on a no-inference frame
             });
 
@@ -248,6 +269,25 @@ int main(int argc, char** argv) {
                 std::printf("  %-14s %3d objects, %8d pts\n",
                             uni.semantics().name(kv.first).c_str(),
                             kv.second.first, kv.second.second);
+        }
+
+        // Sign-text summary. The final annotate() also covers a headless run, where the viz
+        // frame hook (the only other caller) never fires.
+        if (sign_bridge) {
+            std::unordered_map<int, std::string> sign_text =
+                sign_bridge->annotate(obj.list(), uni, p.voxel);
+            std::fflush(stdout);
+            std::printf("sign: %zu sent, %zu dropped (module busy), %zu read, %zu empty/failed "
+                        "| %zu object(s) annotated\n",
+                        sign_bridge->dispatched(), sign_bridge->droppedBusy(),
+                        sign_bridge->resolvedCount(), sign_bridge->failedCount(),
+                        sign_text.size());
+            for (const Object& o : obj.list()) {
+                auto it = sign_text.find(o.id);
+                if (it == sign_text.end()) continue;
+                std::printf("  object %-4d %-14s directionContent=\"%s\"\n",
+                            o.id, uni.semantics().name(o.class_id).c_str(), it->second.c_str());
+            }
         }
 
         if (!out.empty()) {

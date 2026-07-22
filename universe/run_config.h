@@ -5,6 +5,7 @@
 // convenience overrides (--config, --log, --out, --spawn).
 
 #include "semantic_pipeline.h"   // semantic::Params
+#include "sign_config.h"         // sign::SignConfig (dependency-free; sign_adaptor/)
 
 #include <string>
 
@@ -25,6 +26,12 @@ struct RunConfig {
     // ZMQ endpoint for the Python visualizer (viz_server/). Empty => no viz (headless, zero
     // overhead). run_semantic_universe connects a PUSH socket here; viz_server binds PULL.
     std::string viz_endpoint;
+
+    // Sign-text egress (see sign_adaptor/). Disabled by default. When enabled, sign-class
+    // instances are sent to the sign-understanding module and the returned text is attached to
+    // the object containing the sign (EAIRoomObject::directionContent + the rerun label). The
+    // backend is the real VLM module in a LIFT3D_USE_SIGN build, a mock otherwise.
+    sign::SignConfig sign_cfg;
 
     semantic::Params p;                               // all pipeline parameters
 };
